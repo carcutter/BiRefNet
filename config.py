@@ -16,8 +16,19 @@ class Config():
         self.sys_home_dir = [os.path.expanduser('~'), '/workspace'][1]   # Default, custom
         self.data_root_dir = os.path.join(self.sys_home_dir, 'datasets/dis')
 
+        # CSV-based data loading (interior-segmentation project layout).
+        # When use_csv_data is True, train/val image+mask paths are read from CSVs whose rows
+        # contain `image_path,mask_path,...` relative to `csv_data_root`, instead of the
+        # TASK/SET/{im,gt} layout above.
+        self.use_csv_data = True
+        self.csv_data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        self.train_csv = 'train.csv'
+        self.val_csv = 'test_smoke.csv'
+        self.val_every_n_epochs = 1     # 0 disables validation
+        self.val_num_samples = 0        # 0 means all rows in val_csv
+
         # TASK settings
-        self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][0]
+        self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][3]
         self.testsets = {
             # Benchmarks
             'DIS5K': ','.join(['DIS-VD', 'DIS-TE1', 'DIS-TE2', 'DIS-TE3', 'DIS-TE4'][:1]),

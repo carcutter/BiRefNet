@@ -12,7 +12,7 @@ from config import Config
 from loss import PixLoss, ClsLoss
 from dataset import MyData
 from models.birefnet import BiRefNet
-from utils import Logger, AverageMeter, set_seed, check_state_dict
+from utils import Logger, AverageMeter, set_seed, check_state_dict, save_tensor_img
 
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -96,12 +96,42 @@ def prepare_dataloader(dataset: torch.utils.data.Dataset, batch_size: int, to_be
 
 def init_data_loaders(to_be_distributed):
     # Prepare datasets
+    if config.use_csv_data:
+        train_csv = os.path.join(config.csv_data_root, config.train_csv)
+        train_dataset = MyData(
+            datasets=None,
+            data_size=None if config.dynamic_size else config.size,
+            is_train=True,
+            csv_path=train_csv,
+        )
+        train_loader = prepare_dataloader(train_dataset, config.batch_size, to_be_distributed=to_be_distributed, is_train=True)
+        print(len(train_loader), "batches of train dataloader from {} have been created.".format(train_csv))
+
+        val_loader = None
+        if config.val_every_n_epochs and config.val_csv:
+            val_csv = os.path.join(config.csv_data_root, config.val_csv)
+            val_dataset = MyData(
+                datasets=None,
+                data_size=config.size,
+                is_train=False,
+                csv_path=val_csv,
+                max_samples=config.val_num_samples,
+            )
+            # Plain (un-distributed) loader: validation runs only on the main process.
+            val_loader = torch.utils.data.DataLoader(
+                dataset=val_dataset, batch_size=config.batch_size_valid,
+                num_workers=min(config.num_workers, config.batch_size_valid),
+                pin_memory=True, shuffle=False, drop_last=False,
+            )
+            print(len(val_loader), "batches of val dataloader from {} have been created.".format(val_csv))
+        return train_loader, val_loader
+
     train_loader = prepare_dataloader(
         MyData(datasets=config.training_set, data_size=None if config.dynamic_size else config.size, is_train=True),
         config.batch_size, to_be_distributed=to_be_distributed, is_train=True
     )
     print(len(train_loader), "batches of train dataloader {} have been created.".format(config.training_set))
-    return train_loader
+    return train_loader, None
 
 
 def init_models_optimizers(epochs, to_be_distributed):
@@ -152,7 +182,7 @@ class Trainer:
         self, data_loaders, model_opt_lrsch,
     ):
         self.model, self.optimizer, self.lr_scheduler = model_opt_lrsch
-        self.train_loader = data_loaders
+        self.train_loader, self.val_loader = data_loaders
         if args.use_accelerate:
             self.train_loader, self.model, self.optimizer = accelerator.prepare(self.train_loader, self.model, self.optimizer)
         if config.out_ref:
@@ -161,9 +191,79 @@ class Trainer:
         # Setting Losses
         self.pix_loss = PixLoss()
         self.cls_loss = ClsLoss()
-        
+
+        # Image-denorm constants for validation visualization (ImageNet mean/std used in dataset.py).
+        self._imnet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self._imnet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
         # Others
         self.loss_log = AverageMeter()
+
+    def _is_main_process(self):
+        if args.use_accelerate:
+            return accelerator.is_main_process
+        if to_be_distributed:
+            return int(os.environ.get("LOCAL_RANK", "0")) == 0
+        return True
+
+    def _unwrap_model(self):
+        if args.use_accelerate:
+            return accelerator.unwrap_model(self.model)
+        if to_be_distributed:
+            return self.model.module
+        return self.model
+
+    @torch.no_grad()
+    def validate(self, epoch):
+        if self.val_loader is None or not config.val_every_n_epochs:
+            return
+        if epoch % config.val_every_n_epochs != 0:
+            return
+        if not self._is_main_process():
+            return
+
+        model = self._unwrap_model()
+        was_training = model.training
+        model.eval()
+
+        vis_dir = os.path.join(args.ckpt_dir, 'val_vis', 'epoch_{}'.format(epoch))
+        os.makedirs(vis_dir, exist_ok=True)
+        logger.info('Validation @ epoch {}: writing batch/predictions to {}'.format(epoch, vis_dir))
+
+        mixed_precision = config.mixed_precision
+        if mixed_precision == 'fp16':
+            val_autocast = torch.amp.autocast(device_type='cuda', dtype=torch.float16)
+        elif mixed_precision == 'bf16':
+            val_autocast = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+        else:
+            val_autocast = nullcontext()
+
+        val_device = next(model.parameters()).device
+        sample_idx = 0
+        for batch in self.val_loader:
+            inputs = batch[0].to(val_device, non_blocking=True)
+            gts = batch[1]
+            label_paths = batch[2]
+            with val_autocast:
+                preds = model(inputs)
+            if isinstance(preds, (list, tuple)):
+                preds = preds[-1]
+            preds = preds.sigmoid().to(torch.float32)
+
+            inputs_denorm = (inputs.detach().float().cpu() * self._imnet_std + self._imnet_mean).clamp(0, 1)
+            preds_cpu = preds.detach().cpu()
+            gts_cpu = gts.detach().float().cpu()
+
+            for i in range(inputs.shape[0]):
+                stem = os.path.splitext(os.path.basename(label_paths[i]))[0]
+                tag = '{:03d}_{}'.format(sample_idx, stem)
+                save_tensor_img(inputs_denorm[i:i+1], os.path.join(vis_dir, '{}_input.png'.format(tag)))
+                save_tensor_img(preds_cpu[i:i+1], os.path.join(vis_dir, '{}_pred.png'.format(tag)))
+                save_tensor_img(gts_cpu[i:i+1], os.path.join(vis_dir, '{}_gt.png'.format(tag)))
+                sample_idx += 1
+
+        if was_training:
+            model.train()
 
     def _train_batch(self, batch):
         if args.use_accelerate:
@@ -247,6 +347,7 @@ def main():
 
     for epoch in range(epoch_st, args.epochs+1):
         train_loss = trainer.train_epoch(epoch)
+        trainer.validate(epoch)
         # Save checkpoint
         if epoch >= args.epochs - config.save_last and epoch % config.save_step == 0:
             if args.use_accelerate:

@@ -1,4 +1,5 @@
 import os
+import csv
 import random
 import numpy as np
 import cv2
@@ -34,8 +35,10 @@ class_labels_TR_sorted = _class_labels_TR_sorted.split(', ')
 
 
 class MyData(data.Dataset):
-    def __init__(self, datasets, data_size, is_train=True):
+    def __init__(self, datasets, data_size, is_train=True, csv_path=None, max_samples=0):
         # data_size is None when using dynamic_size or data_size is manually set to None (for inference in the original size).
+        # csv_path: if set, load (image_path, mask_path) pairs from a CSV with those columns,
+        #           resolved relative to the CSV's directory. `datasets` is ignored in this mode.
         self.is_train = is_train
         self.data_size = data_size
         self.load_all = config.load_all
@@ -51,24 +54,44 @@ class MyData(data.Dataset):
         self.transform_label = transforms.Compose([
             transforms.ToTensor(),
         ])
-        dataset_root = os.path.join(config.data_root_dir, config.task)
-        # datasets can be a list of different datasets for training on combined sets.
-        self.image_paths = []
-        for dataset in datasets.split('+'):
-            image_root = os.path.join(dataset_root, dataset, 'im')
-            self.image_paths += [os.path.join(image_root, p) for p in os.listdir(image_root) if any(p.endswith(ext) for ext in valid_extensions)]
-        self.label_paths = []
-        for p in self.image_paths:
-            for ext in valid_extensions:
-                ## 'im' and 'gt' may need modifying
-                p_gt = p.replace('/im/', '/gt/')[:-(len(p.split('.')[-1])+1)] + ext
-                file_exists = False
-                if os.path.exists(p_gt):
-                    self.label_paths.append(p_gt)
-                    file_exists = True
-                    break
-            if not file_exists:
-                print('Not exists:', p_gt)
+
+        if csv_path is not None:
+            csv_root = os.path.dirname(os.path.abspath(csv_path))
+            self.image_paths = []
+            self.label_paths = []
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    img_rel = row.get('image_path', '').strip()
+                    msk_rel = row.get('mask_path', '').strip()
+                    if not img_rel or not msk_rel:
+                        continue
+                    img_abs = img_rel if os.path.isabs(img_rel) else os.path.join(csv_root, img_rel)
+                    msk_abs = msk_rel if os.path.isabs(msk_rel) else os.path.join(csv_root, msk_rel)
+                    self.image_paths.append(img_abs)
+                    self.label_paths.append(msk_abs)
+            if max_samples and len(self.image_paths) > max_samples:
+                self.image_paths = self.image_paths[:max_samples]
+                self.label_paths = self.label_paths[:max_samples]
+        else:
+            dataset_root = os.path.join(config.data_root_dir, config.task)
+            # datasets can be a list of different datasets for training on combined sets.
+            self.image_paths = []
+            for dataset in datasets.split('+'):
+                image_root = os.path.join(dataset_root, dataset, 'im')
+                self.image_paths += [os.path.join(image_root, p) for p in os.listdir(image_root) if any(p.endswith(ext) for ext in valid_extensions)]
+            self.label_paths = []
+            for p in self.image_paths:
+                for ext in valid_extensions:
+                    ## 'im' and 'gt' may need modifying
+                    p_gt = p.replace('/im/', '/gt/')[:-(len(p.split('.')[-1])+1)] + ext
+                    file_exists = False
+                    if os.path.exists(p_gt):
+                        self.label_paths.append(p_gt)
+                        file_exists = True
+                        break
+                if not file_exists:
+                    print('Not exists:', p_gt)
 
         if len(self.label_paths) != len(self.image_paths):
             set_image_paths = set([os.path.splitext(p.split(os.sep)[-1])[0] for p in self.image_paths])
