@@ -1,0 +1,6 @@
+outs:
+- md5: e4d7ece14219d3c1410affd8e87f1cb1.dir
+  size: 3603252303
+  nfiles: 21914
+  hash: md5
+  path: interior_segmentation
