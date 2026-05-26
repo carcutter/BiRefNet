@@ -19,7 +19,7 @@ nproc_per_node=$(echo ${devices%%,} | grep -o "," | wc -l)
 to_be_distributed=`echo ${nproc_per_node} | awk '{if($e > 0) print "True"; else print "False";}'`
 
 echo Training started at $(date)
-resume_weights_path='path_to_a_pth'
+resume_weights_path='weights/BiRefNet-DIS-bb_swin_v1_base-epoch_595.pth'
 if [ ${to_be_distributed} == "True" ]
 then
     # Adapt the nproc_per_node by the number of GPUs. Give 8989 as the default value of master_port.
