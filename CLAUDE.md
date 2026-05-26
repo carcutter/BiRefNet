@@ -8,10 +8,14 @@ BiRefNet — official implementation of "Bilateral Reference for High-Resolution
 
 ## Environment
 
+Managed with [uv](https://docs.astral.sh/uv/). Dependencies live in `pyproject.toml` (mirrors `requirements.txt`, kept around for the shell scripts).
+
 ```bash
-conda create -n birefnet python=3.11 -y && conda activate birefnet
-pip install -r requirements.txt        # requires torch>=2.5.0
+uv sync                                # creates .venv and installs from pyproject.toml
+source .venv/bin/activate
 ```
+
+Prefix one-off commands with `uv run` to execute inside the project environment without activating it, e.g. `uv run python config.py --print_task`.
 
 ## Common commands
 
