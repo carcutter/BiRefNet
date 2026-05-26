@@ -25,6 +25,26 @@ def path_to_image(path, size=(1024, 1024), color_type=['rgb', 'gray'][0]):
     return image
 
 
+def path_to_binary_mask_from_colors(path, size=None, fg_colors=((255, 0, 0), (0, 255, 0))):
+    """Load an RGB color-coded segmentation mask and binarize: pixels matching any
+    color in `fg_colors` become foreground (255), all others become background (0).
+
+    Thresholding happens at native resolution before resize, so edge antialiasing in
+    a linear resize won't blur class colors across the threshold.
+    """
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(path)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    fg = np.zeros(rgb.shape[:2], dtype=bool)
+    for color in fg_colors:
+        fg |= np.all(rgb == np.array(color, dtype=np.uint8), axis=-1)
+    bin_mask = (fg.astype(np.uint8) * 255)
+    if size:
+        bin_mask = cv2.resize(bin_mask, size, interpolation=cv2.INTER_LINEAR)
+    return Image.fromarray(bin_mask).convert('L')
+
+
 
 def check_state_dict(state_dict, unwanted_prefixes=['module.', '_orig_mod.']):
     for k, v in list(state_dict.items()):

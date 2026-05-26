@@ -10,7 +10,7 @@ from torchvision import transforms
 
 from image_proc import preproc
 from config import Config
-from utils import path_to_image
+from utils import path_to_image, path_to_binary_mask_from_colors
 
 
 Image.MAX_IMAGE_PIXELS = None       # remove DecompressionBombWarning
@@ -35,10 +35,11 @@ class_labels_TR_sorted = _class_labels_TR_sorted.split(', ')
 
 
 class MyData(data.Dataset):
-    def __init__(self, datasets, data_size, is_train=True, csv_path=None, max_samples=0):
+    def __init__(self, datasets, data_size, is_train=True, csv_path=None, csv_image_root=None, max_samples=0):
         # data_size is None when using dynamic_size or data_size is manually set to None (for inference in the original size).
-        # csv_path: if set, load (image_path, mask_path) pairs from a CSV with those columns,
-        #           resolved relative to the CSV's directory. `datasets` is ignored in this mode.
+        # csv_path: if set, load (image_path, mask_path) pairs from a CSV with those columns.
+        #           Paths inside the CSV resolve against csv_image_root (defaults to the CSV's
+        #           own directory). `datasets` is ignored in this mode.
         self.is_train = is_train
         self.data_size = data_size
         self.load_all = config.load_all
@@ -56,7 +57,7 @@ class MyData(data.Dataset):
         ])
 
         if csv_path is not None:
-            csv_root = os.path.dirname(os.path.abspath(csv_path))
+            path_root = csv_image_root if csv_image_root else os.path.dirname(os.path.abspath(csv_path))
             self.image_paths = []
             self.label_paths = []
             with open(csv_path, 'r', newline='') as f:
@@ -66,8 +67,8 @@ class MyData(data.Dataset):
                     msk_rel = row.get('mask_path', '').strip()
                     if not img_rel or not msk_rel:
                         continue
-                    img_abs = img_rel if os.path.isabs(img_rel) else os.path.join(csv_root, img_rel)
-                    msk_abs = msk_rel if os.path.isabs(msk_rel) else os.path.join(csv_root, msk_rel)
+                    img_abs = img_rel if os.path.isabs(img_rel) else os.path.join(path_root, img_rel)
+                    msk_abs = msk_rel if os.path.isabs(msk_rel) else os.path.join(path_root, msk_rel)
                     self.image_paths.append(img_abs)
                     self.label_paths.append(msk_abs)
             if max_samples and len(self.image_paths) > max_samples:
@@ -105,12 +106,17 @@ class MyData(data.Dataset):
             # for image_path, label_path in zip(self.image_paths, self.label_paths):
             for image_path, label_path in tqdm(zip(self.image_paths, self.label_paths), total=len(self.image_paths)):
                 _image = path_to_image(image_path, size=self.data_size, color_type='rgb')
-                _label = path_to_image(label_path, size=self.data_size, color_type='gray')
+                _label = self._load_label(label_path)
                 self.images_loaded.append(_image)
                 self.labels_loaded.append(_label)
                 self.class_labels_loaded.append(
                     self.cls_name2id[label_path.split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
                 )
+
+    def _load_label(self, path):
+        if getattr(config, 'mask_color_to_binary', False):
+            return path_to_binary_mask_from_colors(path, size=self.data_size, fg_colors=config.mask_fg_colors)
+        return path_to_image(path, size=self.data_size, color_type='gray')
 
     def __getitem__(self, index):
         if self.load_all:
@@ -119,7 +125,7 @@ class MyData(data.Dataset):
             class_label = self.class_labels_loaded[index] if self.is_train and config.auxiliary_classification else -1
         else:
             image = path_to_image(self.image_paths[index], size=self.data_size, color_type='rgb')
-            label = path_to_image(self.label_paths[index], size=self.data_size, color_type='gray')
+            label = self._load_label(self.label_paths[index])
             class_label = self.cls_name2id[self.label_paths[index].split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
 
         # loading image and label

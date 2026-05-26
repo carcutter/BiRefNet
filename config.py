@@ -17,15 +17,23 @@ class Config():
         self.data_root_dir = os.path.join(self.sys_home_dir, 'datasets/dis')
 
         # CSV-based data loading (interior-segmentation project layout).
-        # When use_csv_data is True, train/val image+mask paths are read from CSVs whose rows
-        # contain `image_path,mask_path,...` relative to `csv_data_root`, instead of the
-        # TASK/SET/{im,gt} layout above.
+        # When use_csv_data is True, MyData reads (image_path, mask_path) pairs from a CSV.
+        #   csv_data_root: directory containing train_csv / val_csv files
+        #   csv_image_root: directory the in-CSV paths resolve against (defaults to csv_data_root
+        #                   when None). Split because CSVs are versioned with the index but the
+        #                   bulk images live under a symlinked `data_link/` -> full dataset.
+        _here = os.path.dirname(os.path.abspath(__file__))
         self.use_csv_data = True
-        self.csv_data_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        self.csv_data_root = os.path.join(_here, 'data', 'interior_segmentation')
+        self.csv_image_root = os.path.join(_here, 'data_link')
         self.train_csv = 'train.csv'
         self.val_csv = 'test_smoke.csv'
         self.val_every_n_epochs = 1     # 0 disables validation
         self.val_num_samples = 0        # 0 means all rows in val_csv
+        # GT masks are color-coded class maps (R/G/B/black). For binary segmentation,
+        # treat the listed RGB colors as foreground and everything else as background.
+        self.mask_color_to_binary = True
+        self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))   # red + green
 
         # TASK settings
         self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][3]
@@ -99,7 +107,7 @@ class Config():
 
             'dino_v3_7b', 'dino_v3_h_plus', 'dino_v3_l',
             'dino_v3_b', 'dino_v3_s_plus', 'dino_v3_s',
-        ][3]
+        ][4]    # swin_v1_b — matches local checkpoint weights/BiRefNet-DIS-bb_swin_v1_base-epoch_595.pth
         self.freeze_bb = 'dino_v3' in self.bb
         self.lateral_channels_in_collection = {
             'vgg16': [512, 512, 256, 128], 'vgg16bn': [512, 512, 256, 128], 'resnet50': [2048, 1024, 512, 256],

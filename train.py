@@ -103,6 +103,7 @@ def init_data_loaders(to_be_distributed):
             data_size=None if config.dynamic_size else config.size,
             is_train=True,
             csv_path=train_csv,
+            csv_image_root=config.csv_image_root,
         )
         train_loader = prepare_dataloader(train_dataset, config.batch_size, to_be_distributed=to_be_distributed, is_train=True)
         print(len(train_loader), "batches of train dataloader from {} have been created.".format(train_csv))
@@ -115,6 +116,7 @@ def init_data_loaders(to_be_distributed):
                 data_size=config.size,
                 is_train=False,
                 csv_path=val_csv,
+                csv_image_root=config.csv_image_root,
                 max_samples=config.val_num_samples,
             )
             # Plain (un-distributed) loader: validation runs only on the main process.
