@@ -7,7 +7,7 @@ case "${task}" in
     'DIS5K') epochs=500 && val_last=50 && step=5 ;;
     'COD') epochs=150 && val_last=50 && step=5 ;;
     'HRSOD') epochs=150 && val_last=50 && step=5 ;;
-    'General') epochs=200 && val_last=50 && step=5 ;;
+    'General') epochs=645 && val_last=50 && step=5 ;;   # resume from epoch_595 -> +50 finetune epochs (absolute target)
     'General-2K') epochs=250 && val_last=30 && step=2 ;;
     'Matting') epochs=150 && val_last=50 && step=5 ;;
 esac
