@@ -10,7 +10,7 @@ from torchvision import transforms
 
 from image_proc import preproc
 from config import Config
-from utils import path_to_image, path_to_binary_mask_from_colors
+from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg
 
 
 Image.MAX_IMAGE_PIXELS = None       # remove DecompressionBombWarning
@@ -35,11 +35,16 @@ class_labels_TR_sorted = _class_labels_TR_sorted.split(', ')
 
 
 class MyData(data.Dataset):
-    def __init__(self, datasets, data_size, is_train=True, csv_path=None, csv_image_root=None, max_samples=0):
+    def __init__(self, datasets, data_size, is_train=True, csv_path=None, csv_image_root=None,
+                 max_samples=0, val_split=0.0, csv_split_seed=42):
         # data_size is None when using dynamic_size or data_size is manually set to None (for inference in the original size).
         # csv_path: if set, load (image_path, mask_path) pairs from a CSV with those columns.
         #           Paths inside the CSV resolve against csv_image_root (defaults to the CSV's
         #           own directory). `datasets` is ignored in this mode.
+        # val_split > 0: treat csv_path as a full index and produce the train (1-val_split)
+        #           or val (val_split) slice. The split is deterministic w.r.t. csv_split_seed
+        #           — calling this constructor twice with the same seed but flipped is_train
+        #           yields disjoint, complementary subsets.
         self.is_train = is_train
         self.data_size = data_size
         self.load_all = config.load_all
@@ -58,8 +63,7 @@ class MyData(data.Dataset):
 
         if csv_path is not None:
             path_root = csv_image_root if csv_image_root else os.path.dirname(os.path.abspath(csv_path))
-            self.image_paths = []
-            self.label_paths = []
+            pairs = []   # list of (img_abs, msk_abs)
             with open(csv_path, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -69,8 +73,20 @@ class MyData(data.Dataset):
                         continue
                     img_abs = img_rel if os.path.isabs(img_rel) else os.path.join(path_root, img_rel)
                     msk_abs = msk_rel if os.path.isabs(msk_rel) else os.path.join(path_root, msk_rel)
-                    self.image_paths.append(img_abs)
-                    self.label_paths.append(msk_abs)
+                    pairs.append((img_abs, msk_abs))
+
+            if val_split and 0.0 < val_split < 1.0:
+                # Deterministic 80/20-style split. Same seed + flipped is_train ⇒ disjoint subsets.
+                rng = np.random.default_rng(csv_split_seed)
+                idx = np.arange(len(pairs))
+                rng.shuffle(idx)
+                n_val = int(round(len(pairs) * val_split))
+                val_idx = set(idx[:n_val].tolist())
+                keep = (lambda i: i not in val_idx) if is_train else (lambda i: i in val_idx)
+                pairs = [p for i, p in enumerate(pairs) if keep(i)]
+
+            self.image_paths = [p[0] for p in pairs]
+            self.label_paths = [p[1] for p in pairs]
             if max_samples and len(self.image_paths) > max_samples:
                 self.image_paths = self.image_paths[:max_samples]
                 self.label_paths = self.label_paths[:max_samples]
@@ -114,7 +130,15 @@ class MyData(data.Dataset):
                 )
 
     def _load_label(self, path):
-        if getattr(config, 'mask_color_to_binary', False):
+        mode = getattr(config, 'mask_color_to_binary', False)
+        # Back-compat: True ⇒ legacy 'colors' mode; False / falsy ⇒ grayscale luminance.
+        if mode is True:
+            mode = 'colors'
+        elif mode is False or mode is None or mode == '':
+            mode = 'none'
+        if mode == 'nonbg':
+            return path_to_binary_mask_nonbg(path, size=self.data_size, bg_colors=config.mask_bg_colors)
+        if mode == 'colors':
             return path_to_binary_mask_from_colors(path, size=self.data_size, fg_colors=config.mask_fg_colors)
         return path_to_image(path, size=self.data_size, color_type='gray')
 

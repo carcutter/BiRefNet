@@ -28,12 +28,21 @@ class Config():
         self.csv_image_root = os.path.join(_here, 'data_link')
         self.train_csv = 'train.csv'
         self.val_csv = 'test_smoke.csv'
+        # When set, MyData reads this single CSV and produces train/val slices at
+        # construction time. Takes precedence over train_csv/val_csv when val_split > 0.
+        self.csv_index = ''             # e.g. 'index.csv' to use rng-based split
+        self.val_split = 0.2            # ignored unless csv_index is set
+        self.csv_split_seed = 42        # rng seed for the 80/20 split
         self.val_every_n_epochs = 1     # 0 disables validation
         self.val_num_samples = 0        # 0 means all rows in val_csv
         # GT masks are color-coded class maps (R/G/B/black). For binary segmentation,
-        # treat the listed RGB colors as foreground and everything else as background.
-        self.mask_color_to_binary = True
-        self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))   # red + green
+        # collapse them into a single foreground/background mask.
+        #   'none':   load mask as a grayscale image (luminance becomes mask). Original behaviour.
+        #   'nonbg':  any pixel not in mask_bg_colors becomes foreground (union of all classes).
+        #   'colors': only pixels matching one of mask_fg_colors become foreground.
+        self.mask_color_to_binary = 'nonbg'
+        self.mask_bg_colors = ((0, 0, 0),)                  # used when mode == 'nonbg'
+        self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))    # used when mode == 'colors'
 
         # TASK settings
         self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][3]
