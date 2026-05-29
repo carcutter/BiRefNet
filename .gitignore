@@ -153,3 +153,12 @@ dmypy.json
 
 data/
 weights/
+
+# Training scaffold (YAML/CSV workflow)
+runs/
+reports/
+wandb/
+tools/viewer/manifest.json
+
+# Machine-specific dataset symlink (points to a local absolute path)
+data_link
