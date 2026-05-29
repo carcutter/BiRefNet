@@ -218,6 +218,24 @@ def main():
                     written.append(p)
                 sample_idx += 1
 
+    # --- 4b. TensorBoard writer smoke ---
+    print('\n==> Writing a TensorBoard event and verifying it lands on disk')
+    from torch.utils.tensorboard import SummaryWriter
+    tb_dir = os.path.join(CKPT_DIR, 'tb')
+    os.makedirs(tb_dir, exist_ok=True)
+    w = SummaryWriter(log_dir=tb_dir)
+    w.add_scalar('Train/loss', float(loss.item()), 0)
+    w.add_scalar('Val/IoU', 0.0, 0)
+    # Tiny image panel
+    import torchvision.utils as vutils
+    grid = vutils.make_grid(inputs_denorm[:1], nrow=1, padding=2)
+    w.add_image('Inputs/augmented', grid, 0)
+    w.flush(); w.close()
+    import glob as _glob
+    events = _glob.glob(os.path.join(tb_dir, 'events.out.tfevents.*'))
+    check(len(events) >= 1, 'tfevents file written under {}'.format(tb_dir))
+    check(os.path.getsize(events[0]) > 0, 'tfevents file is non-empty ({} bytes)'.format(os.path.getsize(events[0])))
+
     # --- 5. Assertions on logged outputs ---
     print('\n==> Verifying validation outputs')
     expected_count = len(val_ds) * 3
