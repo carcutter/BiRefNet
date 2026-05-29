@@ -123,10 +123,49 @@ Outputs (all gitignored):
 - `e_results/<testset>_eval.txt` — eval tables
 - `tb_logs/` — TensorBoard scalars and image samples
 
+## 5b. Train with the YAML/CSV scaffold
+
+Preferred for interior-segmentation: drives off `configs/*.yaml` and a CSV index instead of `train.sh`. CLI flags override YAML which overrides argparse defaults; unknown YAML keys fail loudly.
+
+```bash
+# Build the CSV index once (image↔mask pairs across data_link/<dataset>/raw|masks/).
+uv run python build_dataset_csv.py --data_root data_link
+
+# Train. CLI > YAML > defaults. Resolved config dumped to <ckpt_dir>/config.resolved.yaml.
+uv run python train.py --config configs/default.yaml --ckpt_dir runs/my-run
+
+# Pick the experiment-logging backend(s): tensorboard | wandb | both | none (default: both).
+# Wandb runs land under <ckpt_dir>/tb/wandb/, TB events under <ckpt_dir>/tb/.
+
+# Post-training HTML report (same val_split / seed as training!).
+uv run python tools/report.py --checkpoint runs/my-run/epoch_X.pth --top_n 16
+
+# Inference over an arbitrary folder.
+uv run python tools/predict_folder.py --checkpoint runs/my-run/epoch_X.pth \
+    --input_dir /path/to/imgs --out /tmp/preds
+
+# Static dataset viewer.
+uv run python tools/viewer/build_viewer_manifest.py --limit 500
+uv run python tools/serve.py             # then open http://localhost:8765/tools/viewer/
+
+# ONNX export — see "ONNX export limitations" below.
+uv run python tools/export_onnx.py --checkpoint runs/my-run/epoch_X.pth --input_size 512,512 --check
+
+# Smoke test the whole scaffold in ≤ ~2 min.
+./smoke_test.sh
+
+# Probe the max training batch size for the current GPU + input size + AMP setting.
+# Recommended is `int(ceiling * 0.9)` — paste it into configs/*.yaml by hand.
+uv run python tools/find_max_batch_size.py --input_size 1024,1024 --amp --out runs/max_batch.yaml
+```
+
+**ONNX export limitations.** `config.dec_att = 'ASPPDeformable'` (the default) uses `torchvision::deform_conv2d`, which has no standard ONNX operator. The export will fail with `UnsupportedOperatorError` until either (a) you register a custom symbolic for it, or (b) you switch to `dec_att = 'ASPP'` (or `''`) and re-train. `smoke_test.sh` treats this exact failure as a soft warning so the rest of the scaffold is still validated.
+
 ## 6. Monitor
 
 ```bash
-uv run tensorboard --logdir tb_logs --port 6006
+uv run tensorboard --logdir tb_logs --port 6006   # legacy ckpts/* layout
+uv run tensorboard --logdir runs --port 6006      # YAML/CSV scaffold (recommended)
 ```
 
 ## Troubleshooting

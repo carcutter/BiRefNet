@@ -117,3 +117,66 @@ Losses (`loss.py`): `PixLoss` builds a dict of criteria from `config.lambdas_pix
 2. Either reuse one of the existing task names or rename a task (e.g. replace every `'General'` in the project with your task name — there are references in `config.py`, `train.sh`, `eval_existingOnes.py`, `gen_best_ep.py`).
 3. Adjust `testsets`, `training_set`, `lambdas_pix_last` in `config.py`.
 4. Resume from a pretrained `.pth` via the `resume_weights_path` variable inside `train.sh` — `--epochs` is the **absolute** target epoch, not "epochs to add" (because `epoch_st` is parsed from the resume filename).
+
+## Training scaffold (CSV-driven workflow)
+
+When `config.use_csv_data = True` (the default in this project), training is driven by `configs/*.yaml` + a CSV index, not by `task` / `training_set`. This skips the `${data_root_dir}/<TASK>/<DATASET>/im` layout entirely.
+
+```bash
+# Index the dataset (image↔mask pairs across multiple subdirs).
+uv run python build_dataset_csv.py --data_root data_link --out data/interior_segmentation/index.csv
+
+# Train. Override chain: argparse defaults  <  --config yaml  <  CLI flags.
+uv run python train.py --config configs/default.yaml --ckpt_dir runs/myrun
+# CLI always wins: `--epochs 1` overrides whatever is in the YAML.
+
+# The 80/20 split is reproducible from --csv_index + --val_split + --csv_split_seed.
+# Same seed + flipped is_train ⇒ disjoint, complementary subsets.
+
+# Experiment logging — pick: tensorboard | wandb | both | none. Default: both.
+# TB events: runs/<run>/tb/events.out.tfevents.*
+# Wandb run dirs: runs/<run>/tb/wandb/{offline-run-*,run-*}/
+
+# Metrics HTML report (must use same val_split/seed as training).
+uv run python tools/report.py --checkpoint runs/myrun/epoch_X.pth --top_n 16
+
+# Inference over an arbitrary folder.
+uv run python tools/predict_folder.py --checkpoint runs/myrun/epoch_X.pth \
+    --input_dir /path/to/images --out /path/to/output
+
+# Static dataset viewer (rebuild manifest after editing the CSV).
+uv run python tools/viewer/build_viewer_manifest.py --limit 500
+uv run python tools/serve.py            # then open http://localhost:8765/tools/viewer/
+
+# ONNX export + parity check (see limitation below).
+uv run python tools/export_onnx.py --checkpoint runs/myrun/epoch_X.pth --input_size 512,512 --check
+
+# End-to-end smoke test (≤ ~2 min).
+./smoke_test.sh
+```
+
+**YAML override chain.** Every entry point (`train.py`, `tools/report.py`, `tools/predict_folder.py`, `tools/export_onnx.py`) takes `--config <file.yaml>`. Precedence is **argparse defaults < YAML < CLI flags**. Unknown YAML keys raise `SystemExit` — typos fail loudly. The resolved config is dumped to `<ckpt_dir>/config.resolved.yaml` at train start so a run is reproducible from artifacts alone.
+
+**Metrics.** `Val/Contour_mIoU` is a boundary-IoU metric (ring of ±`--contour_radius` px around each contour). Tracking it alongside `Val/IoU` catches the failure mode where interior IoU keeps climbing while the model learns blobs instead of crisp edges.
+
+**ONNX export limitations.** `config.dec_att = 'ASPPDeformable'` (the default) uses `torchvision::deform_conv2d`, which has no standard ONNX operator. The export will fail with `UnsupportedOperatorError` until either (a) you register a custom symbolic for it, or (b) you switch to `dec_att = 'ASPP'` (or `''`) and re-train. The smoke test treats this specific failure as a soft warning.
+
+**Smoke-mode quirks.** `--smoke_test N` forces `--epochs 1`, drops to 512×512, disables `compile`, and (since `epoch_st` parsed from `--resume`'s `_epoch_N.pth` suffix would otherwise skip the loop entirely) resets `epoch_st = 1` so training actually runs.
+
+**Max-batch-size probe.** When the model, input size, GPU, or AMP setting changes, re-run the probe to pick a sane `batch_size` for `configs/*.yaml`:
+
+```bash
+uv run python tools/find_max_batch_size.py \
+    [--config configs/default.yaml] [--checkpoint <ckpt>.pth] \
+    [--input_size H,W] [--amp] [--start_batch 2] [--max_batch 64] \
+    [--margin 0.9] [--warmup_iters 3] [--out runs/max_batch.yaml]
+# Strategy: doubling → binary search → margin (0.9 by default).
+# Prints `recommended=<int>  ceiling=<int>`. Paste recommended into the YAML by hand.
+```
+
+Notes:
+- The probe runs **forward + backward + optimizer.step** for `--warmup_iters` real iterations per candidate — single-forward probes under-estimate memory by 2-3× because gradients aren't committed yet.
+- `--no_backward` produces an **inference-only** number that is NOT safe as the training batch size.
+- BatchNorm in `train()` mode rejects batches of 1, so `--start_batch 2` is the default.
+- The 0.9 margin absorbs allocator-fragmentation OOMs that show up hundreds of iters into a long run. Don't paste a value above `recommended` without bumping the margin too.
+- Re-run after: model architecture change, GPU swap, input-resolution change, or toggling AMP.
