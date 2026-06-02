@@ -1,4 +1,6 @@
 import os
+import sys
+import math
 import datetime
 from contextlib import nullcontext
 import argparse
@@ -8,6 +10,34 @@ import torch.nn.functional as F
 import torch.optim as optim
 if tuple(map(int, torch.__version__.split('+')[0].split(".")[:3])) >= (2, 5, 0):
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+def _preset_backbone_env():
+    """The backbone (config.bb) drives channel counts that are read when each module builds its
+    own Config() — including the model's, inside BiRefNet.__init__. Resolve the requested backbone
+    from --bb / the --config YAML and export it as BIREFNET_BB *before* Config is imported below,
+    so every Config() derives matching channels. CLI --bb wins over the YAML key. Mirrors the
+    'set before import' approach in smoke_test.py."""
+    argv = sys.argv[1:]
+    def _flag(name):
+        for i, a in enumerate(argv):
+            if a == name and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(name + '='):
+                return a.split('=', 1)[1]
+        return None
+    bb = _flag('--bb')
+    if bb is None:
+        cfg_path = _flag('--config')
+        if cfg_path and os.path.isfile(cfg_path):
+            import yaml
+            with open(cfg_path) as f:
+                bb = (yaml.safe_load(f) or {}).get('bb')
+    if bb:
+        os.environ['BIREFNET_BB'] = str(bb)
+
+
+_preset_backbone_env()
 
 from config import Config
 from loss import PixLoss, ClsLoss
@@ -103,6 +133,8 @@ def build_parser():
     p.add_argument('--wandb_project', default='birefnet-interior', type=str)
     p.add_argument('--wandb_run_name', default=None, type=str,
                    help='W&B run name; defaults to the basename of --ckpt_dir.')
+    p.add_argument('--wandb_entity', default='meero-rd', type=str,
+                   help='W&B entity (team) the run is logged under.')
     p.add_argument('--smoke_test', default=0, type=int,
                    help='If > 0, cap train + val to this many batches per epoch and force --epochs=1. '
                         'Skips checkpoint pruning and any heavy artifacts.')
@@ -116,6 +148,16 @@ def build_parser():
     p.add_argument('--csv_split_seed', default=None, type=int,
                    help='Seed for the rng-based 80/20 split. Same seed + flipped is_train ⇒ disjoint '
                         'subsets. Overrides config.csv_split_seed.')
+    p.add_argument('--input_size', default=None, type=str,
+                   help='Override config.size. Accepts a single int (square, e.g. 512) or "H,W"/"HxW". '
+                        'Each side must be divisible by 32.')
+    p.add_argument('--batch_size', default=None, type=int,
+                   help='Override config.batch_size. Re-scales lr by sqrt(new/old) to keep the '
+                        'config.py batch-lr relationship.')
+    p.add_argument('--bb', default=None, type=str,
+                   help='Backbone override (e.g. swin_v1_l for the general-resolution checkpoint, '
+                        'swin_v1_b for the DIS/interior ones). Must match the resume checkpoint\'s '
+                        'architecture. Exported as BIREFNET_BB before Config is built.')
     return p
 
 
@@ -132,6 +174,26 @@ if args.val_split is not None:
     config.val_split = args.val_split
 if args.csv_split_seed is not None:
     config.csv_split_seed = args.csv_split_seed
+if args.input_size is not None:
+    parts = [int(v) for v in str(args.input_size).lower().replace('x', ',').split(',') if v.strip()]
+    if len(parts) == 1:
+        h = w = parts[0]
+    elif len(parts) == 2:
+        h, w = parts
+    else:
+        raise SystemExit('--input_size must be "N" or "H,W", got: {}'.format(args.input_size))
+    if h % 32 or w % 32:
+        raise SystemExit('--input_size sides must be divisible by 32, got: {}x{}'.format(h, w))
+    config.size = (h, w)
+if args.batch_size is not None:
+    if args.batch_size < 1:
+        raise SystemExit('--batch_size must be >= 1, got: {}'.format(args.batch_size))
+    # config.lr/num_workers are derived from batch_size in Config.__init__, so refresh both.
+    # Scale lr by sqrt(new/old) to preserve config.py's sqrt-batch lr relationship without
+    # re-stating the task/base-lr formula here.
+    config.lr *= math.sqrt(args.batch_size / config.batch_size)
+    config.num_workers = max(4, args.batch_size)
+    config.batch_size = args.batch_size
 if args.smoke_test:
     # Smoke runs should validate the pipeline, not the slow paths.
     config.compile = False
@@ -212,12 +274,20 @@ def prepare_dataloader(dataset: torch.utils.data.Dataset, batch_size: int, to_be
         )
 
 
+def _resolve_csv(name):
+    # Allow a CSV name to be either an already-valid path (absolute, or relative to the repo root,
+    # e.g. data/processed/blob_crops.csv) or a bare filename living under config.csv_data_root.
+    if name and (os.path.isabs(name) or os.path.isfile(name)):
+        return name
+    return os.path.join(config.csv_data_root, name)
+
+
 def init_data_loaders(to_be_distributed):
     # Prepare datasets
     if config.use_csv_data:
         use_index_split = bool(getattr(config, 'csv_index', '')) and getattr(config, 'val_split', 0.0) > 0
         if use_index_split:
-            index_csv = os.path.join(config.csv_data_root, config.csv_index)
+            index_csv = _resolve_csv(config.csv_index)
             train_dataset = MyData(
                 datasets=None,
                 data_size=None if config.dynamic_size else config.size,
@@ -230,7 +300,7 @@ def init_data_loaders(to_be_distributed):
             train_source_str = '{} (rng split, seed={}, val={})'.format(
                 index_csv, config.csv_split_seed, config.val_split)
         else:
-            train_csv = os.path.join(config.csv_data_root, config.train_csv)
+            train_csv = _resolve_csv(config.train_csv)
             train_dataset = MyData(
                 datasets=None,
                 data_size=None if config.dynamic_size else config.size,
@@ -249,7 +319,7 @@ def init_data_loaders(to_be_distributed):
                     datasets=None,
                     data_size=config.size,
                     is_train=False,
-                    csv_path=os.path.join(config.csv_data_root, config.csv_index),
+                    csv_path=_resolve_csv(config.csv_index),
                     csv_image_root=config.csv_image_root,
                     val_split=config.val_split,
                     csv_split_seed=config.csv_split_seed,
@@ -257,7 +327,7 @@ def init_data_loaders(to_be_distributed):
                 )
                 val_source_str = '{} (rng split val slice)'.format(config.csv_index)
             elif config.val_csv:
-                val_csv = os.path.join(config.csv_data_root, config.val_csv)
+                val_csv = _resolve_csv(config.val_csv)
                 val_dataset = MyData(
                     datasets=None,
                     data_size=config.size,
@@ -362,6 +432,7 @@ class Trainer:
                 backends=backends,
                 run_dir=tb_dir,
                 project=args.wandb_project,
+                entity=args.wandb_entity if hasattr(args, 'wandb_entity') else 'meero-rd',
                 run_name=run_name,
                 config={
                     'epochs': args.epochs, 'batch_size': config.batch_size, 'lr': config.lr,
@@ -471,11 +542,11 @@ class Trainer:
         # TensorBoard: epoch-level val scalars + image panel.
         if self.exp_logger is not None and agg['count'] > 0:
             n = agg['count']
-            self.exp_logger.add_scalar('Val/loss', agg['loss'] / n, epoch)
-            self.exp_logger.add_scalar('Val/IoU', agg['iou'] / n, epoch)
-            self.exp_logger.add_scalar('Val/F1', agg['f1'] / n, epoch)
-            self.exp_logger.add_scalar('Val/MAE', agg['mae'] / n, epoch)
-            self.exp_logger.add_scalar('Val/Contour_mIoU', agg['contour_miou'] / n, epoch)
+            self.exp_logger.add_scalar('Val/loss', agg['loss'] / n, epoch, axis='epoch')
+            self.exp_logger.add_scalar('Val/IoU', agg['iou'] / n, epoch, axis='epoch')
+            self.exp_logger.add_scalar('Val/F1', agg['f1'] / n, epoch, axis='epoch')
+            self.exp_logger.add_scalar('Val/MAE', agg['mae'] / n, epoch, axis='epoch')
+            self.exp_logger.add_scalar('Val/Contour_mIoU', agg['contour_miou'] / n, epoch, axis='epoch')
             logger.info('Val @ epoch {}: loss={:.4f}  IoU={:.4f}  F1={:.4f}  MAE={:.4f}  Contour_mIoU={:.4f}  (n={})'.format(
                 epoch, agg['loss'] / n, agg['iou'] / n, agg['f1'] / n, agg['mae'] / n, agg['contour_miou'] / n, n))
             if first_batch_tb is not None:
@@ -485,7 +556,7 @@ class Trainer:
                 gt3 = _to_3ch(gt[:n_show])
                 panel = torch.cat([img[:n_show], gt3, pred3], dim=3)    # [img | gt | pred]
                 grid = make_grid(panel, nrow=1, padding=4)
-                self.exp_logger.add_image('Val/predictions', grid, epoch)
+                self.exp_logger.add_image('Val/predictions', grid, epoch, axis='epoch')
 
         if was_training:
             model.train()
@@ -575,9 +646,9 @@ class Trainer:
 
         # TensorBoard: per-epoch summary scalars.
         if self.exp_logger is not None:
-            self.exp_logger.add_scalar('Train/loss_epoch_avg', self.loss_log.avg, epoch)
+            self.exp_logger.add_scalar('Train/loss_epoch_avg', self.loss_log.avg, epoch, axis='epoch')
             for pg in self.optimizer.param_groups:
-                self.exp_logger.add_scalar('Optim/lr', pg['lr'], epoch)
+                self.exp_logger.add_scalar('Optim/lr', pg['lr'], epoch, axis='epoch')
                 break
 
         self.lr_scheduler.step()
@@ -596,7 +667,7 @@ class Trainer:
         # Each sample becomes a horizontal triple [img | gt | overlay].
         panel = torch.cat([img, gt3, ovl], dim=3)
         grid = make_grid(panel, nrow=1, padding=4)
-        self.exp_logger.add_image('Inputs/augmented', grid, epoch)
+        self.exp_logger.add_image('Inputs/augmented', grid, epoch, axis='epoch')
 
 
 def main():

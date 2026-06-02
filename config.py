@@ -105,7 +105,7 @@ class Config():
         self.num_workers = max(4, self.batch_size)          # will be decreased to min(it, batch_size) at the initialization of the data_loader
 
         # Backbone settings
-        self.bb = [
+        _backbones = [
             'vgg16', 'vgg16bn', 'resnet50',
 
             'swin_v1_l', 'swin_v1_b',
@@ -116,7 +116,14 @@ class Config():
 
             'dino_v3_7b', 'dino_v3_h_plus', 'dino_v3_l',
             'dino_v3_b', 'dino_v3_s_plus', 'dino_v3_s',
-        ][4]    # swin_v1_b — matches local checkpoint weights/BiRefNet-DIS-bb_swin_v1_base-epoch_595.pth
+        ]
+        # Default swin_v1_b — matches weights/BiRefNet-DIS-bb_swin_v1_base-epoch_595.pth.
+        # Overridable via env so a single run can switch backbone (e.g. swin_v1_l for the
+        # general-resolution checkpoint) without editing this file; train.py sets it from
+        # the YAML/--bb BEFORE any Config() is built, so all derivations below stay consistent.
+        self.bb = os.environ.get('BIREFNET_BB') or _backbones[4]
+        if self.bb not in _backbones:
+            raise ValueError('BIREFNET_BB={!r} is not a known backbone. Choose from: {}'.format(self.bb, _backbones))
         self.freeze_bb = 'dino_v3' in self.bb
         self.lateral_channels_in_collection = {
             'vgg16': [512, 512, 256, 128], 'vgg16bn': [512, 512, 256, 128], 'resnet50': [2048, 1024, 512, 256],

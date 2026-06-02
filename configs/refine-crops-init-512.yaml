@@ -1,0 +1,30 @@
+# Default training config for BiRefNet interior-segmentation fine-tuning.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags
+# Unknown keys here fail loudly — argparse `dest` names must match 1:1.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- Training loop ----
+epochs: 695                  # ABSOLUTE target epoch (resume is epoch_645 ⇒ 645 + 50 = 695)
+batch_size: 12               # verified to fit @512 bf16 in the real train path (AdamW+multiscale loss); 16 OOMs. Drop to 8 if a late fragmentation/compile OOM appears.
+bb: swin_v1_l                # general-resolution_512x512 ckpt is swin_v1_l (embed 192); default config.py bb is swin_v1_b (embed 128)
+ckpt_dir: runs/refine-crops-init-512
+resume: weights/BiRefNet-general-resolution_512x512-fp16-epoch_216.pth
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Dataset / split (must match between training and tools/report.py) ----
+input_size: 512              # override config.size (1024); each side must be divisible by 32
+csv_index: data/processed/blob_crops.csv
+val_split: 0.2
+csv_split_seed: 42
+
+# ---- Experiment logging ----
+logger: both                 # one of: tensorboard | wandb | both | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd         # W&B entity (team) name
+
+# ---- Metrics ----
+contour_radius: 2            # boundary-IoU ring half-width in pixels

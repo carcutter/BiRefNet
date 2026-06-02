@@ -62,18 +62,32 @@ class MyData(data.Dataset):
         ])
 
         if csv_path is not None:
-            path_root = csv_image_root if csv_image_root else os.path.dirname(os.path.abspath(csv_path))
+            # Different CSVs use different conventions for relative paths: index.csv stores them
+            # relative to csv_image_root (data_link), while data/processed/*.csv (e.g. blob_crops.csv)
+            # store them relative to the repo root. Try each candidate root and use the first where
+            # the file actually exists, so both layouts load without per-file config.
+            csv_dir = os.path.dirname(os.path.abspath(csv_path))
+            candidate_roots = [r for r in (csv_image_root, os.getcwd(), csv_dir) if r]
+
+            def _resolve(rel):
+                if os.path.isabs(rel):
+                    return rel
+                for root in candidate_roots:
+                    cand = os.path.join(root, rel)
+                    if os.path.exists(cand):
+                        return cand
+                return os.path.join(candidate_roots[0], rel)   # let a clear FileNotFound surface downstream
+
             pairs = []   # list of (img_abs, msk_abs)
             with open(csv_path, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    img_rel = row.get('image_path', '').strip()
-                    msk_rel = row.get('mask_path', '').strip()
+                    # Accept both schemas: image_path/mask_path (index.csv) and image/mask (blob_crops.csv).
+                    img_rel = (row.get('image_path') or row.get('image') or '').strip()
+                    msk_rel = (row.get('mask_path') or row.get('mask') or '').strip()
                     if not img_rel or not msk_rel:
                         continue
-                    img_abs = img_rel if os.path.isabs(img_rel) else os.path.join(path_root, img_rel)
-                    msk_abs = msk_rel if os.path.isabs(msk_rel) else os.path.join(path_root, msk_rel)
-                    pairs.append((img_abs, msk_abs))
+                    pairs.append((_resolve(img_rel), _resolve(msk_rel)))
 
             if val_split and 0.0 < val_split < 1.0:
                 # Deterministic 80/20-style split. Same seed + flipped is_train ⇒ disjoint subsets.
