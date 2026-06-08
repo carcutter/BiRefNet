@@ -1,0 +1,42 @@
+# Coarse BiRefNet model — Swin-L backbone, fine-tuned from the official pretrained weights.
+#
+# This trains the FULL-FRAME coarse segmentation model (train.py / models/birefnet.py), NOT the
+# crop refiner (train_refiner.py). It resumes from the official Swin-L DIS checkpoint and fine-tunes
+# it on the interior dataset, so its predictions become the coarse masks the refiner later cleans up.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags
+# Unknown keys here fail loudly — argparse `dest` names must match 1:1.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- Training loop ----
+# epochs is the ABSOLUTE target epoch: epoch_st is parsed from the resume filename (epoch_590),
+# so 640 = 590 + 50 ⇒ 50 fine-tuning epochs.
+epochs: 640
+batch_size: 2                # Swin-L @1024 is very heavy (~4x the @512 activations). Conservative; re-probe:
+                             #   uv run python tools/find_max_batch_size.py --config configs/coarse-swin-l.yaml --input_size 1024
+                             # Drop to 1 (with grad-accum if you need a larger effective batch) if a run OOMs.
+ckpt_dir: runs/coarse-swin-l
+# Official Swin-L pretrained BiRefNet (DIS, natively trained @1024). Backbone pretrained
+# weights are skipped automatically when resuming from a full checkpoint.
+resume: weights/BiRefNet-DIS-epoch_590.pth
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Model ----
+bb: swin_v1_l                # Swin-L backbone — must match the resume checkpoint's architecture.
+input_size: 1024             # DIS checkpoint's native resolution; each side divisible by 32
+
+# ---- Dataset / split (must match between training and tools/report.py) ----
+csv_index: index.csv         # full interior dataset (data/interior_segmentation/index.csv), NOT the blob crops
+val_split: 0.2
+csv_split_seed: 42
+
+# ---- Experiment logging ----
+logger: both                 # one of: tensorboard | wandb | both | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd       # W&B entity (team) name
+
+# ---- Metrics ----
+contour_radius: 4            # boundary-IoU ring half-width (px); scaled up for the 1024 input (2 @512)
