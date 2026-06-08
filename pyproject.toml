@@ -28,6 +28,8 @@ dependencies = [
     "matplotlib>=3.10.9",
     "onnxruntime>=1.26.0",
     "deform-conv2d-onnx-exporter>=1.2.0",
+    "segmentation-models-pytorch>=0.5.0",
+    "mlflow>=3.13.0",
 ]
 
 [tool.uv.sources]

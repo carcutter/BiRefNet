@@ -1,0 +1,51 @@
+# UNet mask-refiner training config — encoder = resnet50.
+# Variant of configs/refiner.yaml; only encoder_name + ckpt_dir differ.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags.
+# Unknown keys fail loudly — every key must match a train_refiner.py argparse dest.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- training loop ----
+epochs: 200
+ckpt_dir: runs/refiner-resnet50
+batch_size: 32               # Largest power-of-2 that fits on an L40S @512 fp32 (probed; 64 OOMs).
+                             #   uv run python tools/find_max_batch_size_refiner.py \
+                             #     --encoder_name resnet50 --use_mask_input true --input_size 512 --pow2
+                             # No fragmentation margin (power-of-2 at the edge) — drop to 16 if a long run OOMs.
+lr: 0.001
+input_size: 512              # crops are 512x512; divisible by 32
+num_workers: 8
+resume: null
+
+# ---- model ----
+use_mask_input: true         # 4ch input: crop RGB + degraded mask (the refiner setup)
+encoder_name: resnet50
+encoder_weights: imagenet    # 'none' for random init
+
+# ---- data / split (must match across train + any eval) ----
+csv_index: data/processed/blob_crops.csv
+val_split: 0.2
+csv_split_seed: 42
+val_num_samples: 512         # cap val for speed (0 = full val split)
+
+# ---- loss weights ----
+w_delta: 1.0                 # L1 on the predicted mask delta vs (gt - degraded) — the residual target
+w_bce: 0.0                   # full-image BCE; inactive in residual mode (used only in crop-only)
+w_dice: 1.0                 # Dice on the reconstructed refined mask vs GT
+w_boundary: 1.0              # BCE restricted to the GT contour ring
+w_contour_iou: 1.0          # (1 - soft IoU) on the GT contour ring — pushes crisp, high-quality edges
+contour_radius: 2
+
+# ---- mask degradation (simulates the coarse model's predictions) ----
+degrade_max_radius: 6        # max erosion/dilation kernel radius (px)
+degrade_max_down: 8          # max downsample factor for the blur step
+degrade_morph_prob: 0.8
+degrade_downsample_prob: 0.8
+degrade_affine_prob: 0.4
+degrade_noise_prob: 0.3
+
+# ---- experiment logging ----
+logger: both                 # tensorboard | wandb | mlflow | both (tb+wandb) | all (tb+wandb+mlflow) | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd

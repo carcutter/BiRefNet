@@ -1,0 +1,53 @@
+# UNet training config — encoder = efficientnet-b4, INPUT = crop RGB only (3ch), NO mask.
+#
+# RGB-only control for the efficientnet-b4 refiner: same encoder / data / split / schedule as
+# configs/refiner-efficientnet-b4.yaml, but the model gets only the crop image — a plain
+# segmentation UNet with no degraded-mask channel and no residual refinement. Use it to measure
+# how much the coarse-mask input + residual delta loss actually buy over learning the mask cold.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags.
+# Unknown keys fail loudly — every key must match a train_refiner.py argparse dest.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- training loop ----
+epochs: 200
+ckpt_dir: runs/refiner-efficientnet-b4-crop-only
+batch_size: 16               # efficientnet-b4 @512 fp32 on an L40S (matches the refiner config; 3ch is lighter)
+lr: 0.001
+input_size: 512              # crops are 512x512; divisible by 32
+num_workers: 8
+resume: null
+
+# ---- model ----
+use_mask_input: false        # 3ch input: crop RGB only (no degraded-mask channel, no residual)
+encoder_name: efficientnet-b4
+encoder_weights: imagenet    # 'none' for random init
+
+# ---- data / split (must match across train + any eval) ----
+csv_index: data/processed/blob_crops.csv
+val_split: 0.2
+csv_split_seed: 42
+val_num_samples: 512         # cap val for speed (0 = full val split)
+
+# ---- loss weights ----
+# Crop-only is DIRECT segmentation (no mask input ⇒ no residual): w_bce drives the pixel loss
+# and the residual w_delta term is inactive (argparse default, no conditioning mask to refine).
+w_bce: 1.0
+w_dice: 1.0
+w_boundary: 1.0              # BCE restricted to the GT contour ring
+w_contour_iou: 1.0          # (1 - soft IoU) on the GT contour ring — pushes crisp, high-quality edges
+contour_radius: 2
+
+# ---- mask degradation (UNUSED when use_mask_input=false; kept for key compatibility) ----
+degrade_max_radius: 6
+degrade_max_down: 8
+degrade_morph_prob: 0.8
+degrade_downsample_prob: 0.8
+degrade_affine_prob: 0.4
+degrade_noise_prob: 0.3
+
+# ---- experiment logging ----
+logger: both                 # tensorboard | wandb | mlflow | both (tb+wandb) | all (tb+wandb+mlflow) | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd

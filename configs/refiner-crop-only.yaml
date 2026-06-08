@@ -1,0 +1,50 @@
+# UNet training config — INPUT = crop RGB only (3ch), NO mask.
+#
+# Same data/split/loss as configs/refiner.yaml, but the model gets only the crop image:
+# this is a plain segmentation UNet (no degraded-mask input, no passthrough baseline). Useful
+# as a control to measure how much the coarse-mask input actually helps the refiner.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags.
+
+# ---- training loop ----
+epochs: 50
+ckpt_dir: runs/refiner-crop-only
+batch_size: 16               # efficientnet-b4 @512 fp32 on an L40S (matches the refiner config)
+lr: 0.001
+input_size: 512              # crops are 512x512; divisible by 32
+num_workers: 8
+resume: null
+
+# ---- model ----
+use_mask_input: false        # 3ch input: crop RGB only (no degraded-mask channel)
+encoder_name: efficientnet-b4
+encoder_weights: imagenet    # 'none' for random init
+
+# ---- data / split (must match across train + any eval) ----
+csv_index: data/processed/blob_crops.csv
+val_split: 0.2
+csv_split_seed: 42
+val_num_samples: 512         # cap val for speed (0 = full val split)
+
+# ---- loss weights ----
+# Crop-only is DIRECT segmentation (no mask input ⇒ no residual): w_bce drives the pixel loss
+# and the residual w_delta term is inactive (argparse default, no conditioning mask to refine).
+w_bce: 1.0
+w_dice: 1.0
+w_boundary: 1.0              # BCE restricted to the GT contour ring
+w_contour_iou: 1.0           # (1 - soft IoU) on the GT contour ring — pushes crisp, high-quality edges
+contour_radius: 2
+
+# ---- mask degradation (UNUSED when use_mask_input=false; kept for key compatibility) ----
+degrade_max_radius: 6
+degrade_max_down: 8
+degrade_morph_prob: 0.8
+degrade_downsample_prob: 0.8
+degrade_affine_prob: 0.4
+degrade_noise_prob: 0.3
+
+# ---- experiment logging ----
+logger: both                 # tensorboard | wandb | both | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd
