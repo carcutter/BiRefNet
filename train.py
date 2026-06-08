@@ -54,62 +54,12 @@ from experiment_logger import ExperimentLogger, parse_backends
 from yaml_config import parse_args_with_yaml, dump_resolved
 
 
-# ImageNet normalize constants — used to denormalize tensors before logging them as images.
-_IMNET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-_IMNET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-
-
-def _denormalize(x):
-    return (x.float().cpu() * _IMNET_STD + _IMNET_MEAN).clamp(0, 1)
-
-
-def _to_3ch(x):
-    x = x.float().cpu()
-    return x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
-
-
-def _overlay(image, mask, color=(1.0, 0.2, 0.2), alpha=0.5):
-    mask = mask.float().cpu().clamp(0, 1)
-    c = torch.tensor(color).view(1, 3, 1, 1)
-    return (image * (1 - mask * alpha) + c * (mask * alpha)).clamp(0, 1)
-
-
-def _ring(mask, r=2):
-    """Dilation − erosion ⇒ a ring of width ~2r along the contour."""
-    k = 2 * r + 1
-    dil = F.max_pool2d(mask, kernel_size=k, stride=1, padding=r)
-    ero = -F.max_pool2d(-mask, kernel_size=k, stride=1, padding=r)
-    return (dil - ero).clamp(0, 1)
-
-
-@torch.no_grad()
-def _contour_miou(pred_prob, gt, r=2, thresh=0.5, eps=1e-6):
-    """Boundary IoU: IoU on ring masks around the contour. Sensitive to edge sloppiness in a way
-    plain IoU is not — interior pixels dominate plain IoU on large blobs."""
-    pb = (pred_prob > thresh).float()
-    gb = (gt > 0.5).float()
-    pr_ring = _ring(pb, r)
-    gt_ring = _ring(gb, r)
-    inter = (pr_ring * gt_ring).flatten(1).sum(1)
-    union = (pr_ring + gt_ring - pr_ring * gt_ring).flatten(1).sum(1)
-    return ((inter + eps) / (union + eps)).mean().item()
-
-
-def _binary_metrics(pred_prob, gt, eps=1e-7, contour_radius=2):
-    """Per-batch mean IoU / F1 / MAE / Contour_mIoU on a foreground-binary mask.
-    pred_prob in [0,1], gt in [0,1]."""
-    p = (pred_prob > 0.5).float()
-    g = (gt > 0.5).float()
-    inter = (p * g).sum(dim=(1, 2, 3))
-    union = (p + g - p * g).sum(dim=(1, 2, 3))
-    iou = (inter / (union + eps)).mean().item()
-    tp = inter
-    fp = (p * (1 - g)).sum(dim=(1, 2, 3))
-    fn = ((1 - p) * g).sum(dim=(1, 2, 3))
-    f1 = ((2 * tp) / (2 * tp + fp + fn + eps)).mean().item()
-    mae = (pred_prob - gt).abs().mean().item()
-    contour = _contour_miou(pred_prob, gt, r=contour_radius)
-    return {'iou': iou, 'f1': f1, 'mae': mae, 'contour_miou': contour}
+# Metric + image-panel helpers live in metrics.py so train_refiner.py can reuse them
+# without importing this module (whose body parses argv and builds a Config() on import).
+from metrics import (
+    _IMNET_MEAN, _IMNET_STD, _denormalize, _to_3ch, _overlay,
+    _ring, _contour_miou, _binary_metrics,
+)
 
 
 def build_parser():
@@ -126,14 +76,15 @@ def build_parser():
     p.add_argument('--dist', default=False, type=lambda x: x == 'True')
     p.add_argument('--use_accelerate', action='store_true',
                    help='`accelerate launch --multi_gpu train.py --use_accelerate`. Use accelerate for training, good for FP16/BF16/...')
-    p.add_argument('--logger', default='both', choices=['tensorboard', 'wandb', 'both', 'none'],
-                   help='Experiment-logging backend(s). "both" fans out to TB and W&B.')
+    p.add_argument('--logger', default='both', type=str,
+                   help='Experiment-logging backend(s): tensorboard | wandb | mlflow | both (tb+wandb) | '
+                        "all (tb+wandb+mlflow) | none | comma-separated mix e.g. 'wandb,mlflow'.")
     p.add_argument('--contour_radius', default=2, type=int,
                    help='Ring half-width (px) used for the boundary mIoU metric. Scale up at higher input resolutions.')
     p.add_argument('--wandb_project', default='birefnet-interior', type=str)
     p.add_argument('--wandb_run_name', default=None, type=str,
                    help='W&B run name; defaults to the basename of --ckpt_dir.')
-    p.add_argument('--wandb_entity', default='meero-rd', type=str,
+    p.add_argument('--wandb_entity', default='meero_rd', type=str,
                    help='W&B entity (team) the run is logged under.')
     p.add_argument('--smoke_test', default=0, type=int,
                    help='If > 0, cap train + val to this many batches per epoch and force --epochs=1. '
@@ -432,7 +383,7 @@ class Trainer:
                 backends=backends,
                 run_dir=tb_dir,
                 project=args.wandb_project,
-                entity=args.wandb_entity if hasattr(args, 'wandb_entity') else 'meero-rd',
+                entity=args.wandb_entity if hasattr(args, 'wandb_entity') else 'meero_rd',
                 run_name=run_name,
                 config={
                     'epochs': args.epochs, 'batch_size': config.batch_size, 'lr': config.lr,

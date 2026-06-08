@@ -40,9 +40,9 @@ class Config():
         #   'none':   load mask as a grayscale image (luminance becomes mask). Original behaviour.
         #   'nonbg':  any pixel not in mask_bg_colors becomes foreground (union of all classes).
         #   'colors': only pixels matching one of mask_fg_colors become foreground.
-        self.mask_color_to_binary = 'nonbg'
-        self.mask_bg_colors = ((0, 0, 0),)                  # used when mode == 'nonbg'
-        self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))    # used when mode == 'colors'
+        self.mask_color_to_binary = 'colors'
+        self.mask_bg_colors = ((0, 0, 0), (0, 0, 255))      # used when mode == 'nonbg': black + blue are bg
+        self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))    # used when mode == 'colors': red + green are fg
 
         # TASK settings
         self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][3]
@@ -150,7 +150,7 @@ class Config():
         ][0]
 
         # TRAINING settings - inactive
-        self.preproc_methods = ['flip', 'enhance', 'rotate', 'pepper', 'crop'][:4 if not self.background_color_synthesis else 1]
+        self.preproc_methods = ['flip', 'enhance', 'rotate', 'blur', 'crop'][:4 if not self.background_color_synthesis else 1]
         self.optimizer = ['Adam', 'AdamW'][1]
         self.lr_decay_epochs = [1e5]    # Set to negative N to decay the lr in the last N-th epoch.
         self.lr_decay_rate = 0.5

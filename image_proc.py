@@ -1,5 +1,5 @@
 import random
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 import cv2
 import torch
@@ -113,8 +113,8 @@ def preproc(image, label, preproc_methods=['flip']):
         image, label = random_rotate(image, label)
     if 'enhance' in preproc_methods:
         image = color_enhance(image)
-    if 'pepper' in preproc_methods:
-        image = random_pepper(image)
+    if 'blur' in preproc_methods:
+        image = random_blur(image)
     return image, label
 
 
@@ -172,11 +172,10 @@ def random_gaussian(image, mean=0.1, sigma=0.35):
     return Image.fromarray(np.uint8(img))
 
 
-def random_pepper(img, N=0.0015):
-    img = np.array(img)
-    noiseNum = int(N * img.shape[0] * img.shape[1])
-    for i in range(noiseNum):
-        randX = random.randint(0, img.shape[0] - 1)
-        randY = random.randint(0, img.shape[1] - 1)
-        img[randX, randY] = random.randint(0, 1) * 255
-    return Image.fromarray(img)
+def random_blur(image, prob=0.2, radius_range=(0.4, 1.2)):
+    # Light Gaussian blur to mimic mild defocus / soft optics. Applied with `prob` probability
+    # only to the image (not the label). Radius is kept small so edges stay learnable.
+    if random.random() < prob:
+        radius = random.uniform(*radius_range)
+        image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+    return image

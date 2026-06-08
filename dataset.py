@@ -144,8 +144,10 @@ class MyData(data.Dataset):
                 )
 
     def _load_label(self, path):
-        mode = getattr(config, 'mask_color_to_binary', False)
-        # Back-compat: True ⇒ legacy 'colors' mode; False / falsy ⇒ grayscale luminance.
+        # Color mode is the default for this fork (interior masks are RGB color-coded:
+        # red+green=fg, blue+black=bg). A missing attribute therefore falls back to 'colors',
+        # not grayscale. Back-compat: True ⇒ 'colors'; explicit False/None/'' ⇒ grayscale luminance.
+        mode = getattr(config, 'mask_color_to_binary', 'colors')
         if mode is True:
             mode = 'colors'
         elif mode is False or mode is None or mode == '':
