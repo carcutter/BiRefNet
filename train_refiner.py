@@ -52,6 +52,10 @@ def build_parser():
                         "One of: loss | mae (lower=better) | f1 | iou | contour_miou (higher=better) | "
                         "none (disable, per-epoch ckpts only). Default contour_miou — the boundary "
                         "metric that catches the blobs-not-edges failure mode.")
+    p.add_argument('--save_freq', default=5, type=int,
+                   help='Save a per-epoch checkpoint (epoch_N.pth) every N epochs instead of every '
+                        'epoch. A new-best epoch is always saved regardless of this interval (it also '
+                        'refreshes best.pth).')
     # ---- model ----
     p.add_argument('--use_mask_input', default=True, type=_str2bool,
                    help='True ⇒ 4ch input [crop|degraded mask] (refiner). False ⇒ 3ch [crop] (plain segmentation).')
@@ -69,8 +73,9 @@ def build_parser():
                    help='Weight of the L1 on the predicted mask DELTA (gt - degraded input) — the '
                         'residual refinement target. Active only in refiner mode (use_mask_input=True).')
     p.add_argument('--w_bce', default=1.0, type=float,
-                   help='Weight of full-image BCE vs GT. Used only in crop-only mode (use_mask_input='
-                        'False); in residual refiner mode the w_delta term replaces it.')
+                   help='Weight of full-image BCE vs GT on the reconstructed refined mask. Active in '
+                        'both modes (in refiner mode it is computed on the reconstructed prob, not the '
+                        'raw tanh-delta logits).')
     p.add_argument('--w_dice', default=1.0, type=float)
     p.add_argument('--w_boundary', default=1.0, type=float, help='Weight of BCE restricted to GT contour ring.')
     p.add_argument('--w_contour_iou', default=1.0, type=float,
@@ -145,12 +150,14 @@ def refiner_loss(logits, gt, args, cond_mask=None):
     GT mask. It is dense over the whole frame: pred_delta is pushed to 0 wherever the input is
     already correct, which keeps correct regions untouched.
 
-    `w_dice` / `w_boundary` / `w_contour_iou` are computed on the *reconstructed* refined mask vs GT
-    (the boundary/contour terms live on the GT contour ring, exactly where the delta concentrates)
-    to keep edges crisp. `w_locality` penalizes refined foreground far from a dilation of cond_mask.
+    `w_bce` / `w_dice` / `w_boundary` / `w_contour_iou` are computed on the *reconstructed* refined
+    mask vs GT (the boundary/contour terms live on the GT contour ring, exactly where the delta
+    concentrates) to keep edges crisp. `w_locality` penalizes refined foreground far from a dilation
+    of cond_mask.
 
     Crop-only mode (cond_mask is None) has no coarse baseline to refine: it falls back to a direct
-    sigmoid prediction with full-image BCE (`w_bce`), and the w_delta term is inactive.
+    sigmoid prediction and the w_delta term is inactive. The w_bce / w_dice / w_boundary /
+    w_contour_iou terms apply in both modes.
     """
     eps = 1e-6
     ring = _ring(gt, r=args.contour_radius)               # (N,1,H,W) binary, no grad through gt
@@ -159,15 +166,17 @@ def refiner_loss(logits, gt, args, cond_mask=None):
     if cond_mask is not None:
         target_delta = gt - cond_mask                     # supervise on the delta, not the full GT
         delta = (torch.tanh(logits) - target_delta).abs().mean()
-        bce = logits.new_zeros(())
     else:
         delta = logits.new_zeros(())
-        bce = F.binary_cross_entropy_with_logits(logits, gt)
 
     dice = smp.losses.DiceLoss(mode='binary', from_logits=False)(prob, gt)
 
+    # Full-image BCE on the reconstructed refined probability. In refiner mode the model output is a
+    # tanh delta (not a mask logit), so BCE is taken on `prob`, not on `logits`. bce_map is reused
+    # for the contour-ring boundary term below.
     prob_c = prob.clamp(eps, 1.0 - eps)
     bce_map = F.binary_cross_entropy(prob_c, gt, reduction='none')
+    bce = bce_map.mean()
     boundary = (bce_map * ring).sum() / (ring.sum() + eps)
 
     # Differentiable (soft) IoU between the refined prediction and GT within the GT contour ring.
@@ -354,18 +363,26 @@ def main():
             exp_logger.add_scalar('Optim/lr', optimizer.param_groups[0]['lr'], epoch, axis='epoch')
 
         val_metrics = validate(model, val_loader, device, args, exp_logger, epoch, max_batches=max_batches)
-        torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
 
+        # Is this epoch a new best? Decided before saving so a best epoch is always checkpointed
+        # even when it doesn't land on the save_freq interval.
+        is_best = False
         if save_best is not None and val_metrics is not None:
             cur = val_metrics[save_best]
-            improved = cur < best_metric if save_best in lower_better else cur > best_metric
-            if improved:
-                best_metric = cur
-                best_path = os.path.join(args.ckpt_dir, 'best.pth')
-                torch.save(model.state_dict(), best_path)
-                print('  ↳ new best {}={:.4f} (epoch {}) → saved {}'.format(save_best, cur, epoch, best_path))
-                if exp_logger is not None:
-                    exp_logger.add_scalar('Val/best_' + save_best, best_metric, epoch, axis='epoch')
+            is_best = cur < best_metric if save_best in lower_better else cur > best_metric
+
+        # Per-epoch checkpoint only every save_freq epochs (default 5), to avoid one .pth per epoch.
+        # Exceptions always saved: a new-best epoch (also refreshes best.pth below) and the last epoch.
+        if epoch % args.save_freq == 0 or is_best or epoch == args.epochs:
+            torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
+
+        if is_best:
+            best_metric = cur
+            best_path = os.path.join(args.ckpt_dir, 'best.pth')
+            torch.save(model.state_dict(), best_path)
+            print('  ↳ new best {}={:.4f} (epoch {}) → saved {}'.format(save_best, cur, epoch, best_path))
+            if exp_logger is not None:
+                exp_logger.add_scalar('Val/best_' + save_best, best_metric, epoch, axis='epoch')
 
     if exp_logger is not None:
         exp_logger.close()
