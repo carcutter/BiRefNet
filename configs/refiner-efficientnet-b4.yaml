@@ -16,6 +16,7 @@ lr: 0.001
 input_size: 512              # crops are 512x512; divisible by 32
 num_workers: 8
 resume: null
+save_freq: 5                 # save epoch_N.pth every N epochs (a new-best epoch is always saved)
 
 # ---- model ----
 use_mask_input: true         # 4ch input: crop RGB + degraded mask (the refiner setup)
@@ -29,8 +30,8 @@ csv_split_seed: 42
 val_num_samples: 512         # cap val for speed (0 = full val split)
 
 # ---- loss weights ----
-w_delta: 1.0                 # L1 on the predicted mask delta vs (gt - degraded) — the residual target
-w_bce: 0.0                   # full-image BCE; inactive in residual mode (used only in crop-only)
+w_delta: 0.0                 # delta loss disabled — fall back to full-image BCE below
+w_bce: 1.0                   # full-image BCE vs GT — the original/standard loss, re-enabled here
 w_dice: 1.0                 # Dice on the reconstructed refined mask vs GT
 w_boundary: 1.0              # BCE restricted to the GT contour ring
 w_contour_iou: 1.0          # (1 - soft IoU) on the GT contour ring — pushes crisp, high-quality edges
