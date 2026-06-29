@@ -1,0 +1,60 @@
+# Coarse BiRefNet model — Swin-L backbone, 4:3 (landscape) input at the SAME ~1MP pixel budget
+# as the square run (1024x1024 = 1.05M px).
+#
+# Variant of configs/coarse-swin-l-4x3.yaml. That run uses 1024x768 (4:3 but only 0.79MP, 75% of
+# the square budget), so it isolates aspect ratio but at LOWER resolution. This run instead matches
+# the square run's pixel budget while keeping exact 4:3, so the only variable vs the square run is
+# the aspect ratio — not the amount of compute/detail.
+#
+# Resolution choice — 1152x864:
+#   The requested 1184x888 is exactly 4:3 and ~1.05MP, BUT 888 is not divisible by 32 (888/32=27.75)
+#   and the pipeline rejects any side not divisible by 32 (train.py raises SystemExit). For an EXACT
+#   4:3 with both sides /32 the valid sizes are 128m x 96m; the one closest to the 1.05M-px square
+#   budget is m=9 ⇒ 1152x864 (36*32 x 27*32) = 995,328 px (≈0.995MP, 95% of square). Exact 4:3, /32.
+#   (1184x896 would hit 1.06MP but is 1.321:1, ~1% off 4:3 — rejected in favour of an exact ratio.)
+#
+# IMPORTANT — input_size axis order: config.size is consumed only by cv2.resize(img, size), which
+# takes (WIDTH, HEIGHT). So the FIRST value is the width. "1152x864" ⇒ 1152 wide x 864 tall
+# (4:3 landscape). (train.py's --input_size help labels these "H,W", but that label is inverted
+# relative to the actual cv2 (W,H) usage — General-2K's (2560,1440) is likewise W x H landscape.)
+# Both sides must be divisible by 32: 1152/32=36, 864/32=27. ✓
+#
+# Kept separate from the square / 1024x768 runs via ckpt_dir/run name so all three are comparable
+# (same pretrained baseline, same split, same schedule — only the input resolution/aspect differs).
+#
+# Precedence (strict): argparse defaults < this file < CLI flags
+# Unknown keys here fail loudly — argparse `dest` names must match 1:1.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- Training loop ----
+# epochs is the ABSOLUTE target epoch: epoch_st is parsed from the resume filename (epoch_590),
+# so 640 = 590 + 50 ⇒ 50 fine-tuning epochs (mirrors the other coarse runs for a fair comparison).
+epochs: 640
+batch_size: 2                # 1152x864 ≈ 0.995MP ≈ the square run's budget, which also used 2.
+                             # Re-probe if you want to push it:
+                             #   uv run python tools/find_max_batch_size.py --config configs/coarse-swin-l-4x3-1MP.yaml --input_size 1152x864
+ckpt_dir: runs/coarse-swin-l-4x3-1MP        # separate output dir ⇒ does not touch the other coarse runs
+# Official Swin-L pretrained BiRefNet (DIS, natively trained @1024). Start from the SAME baseline
+# as the square / 1024x768 runs so the only difference under test is the input resolution/aspect.
+resume: weights/BiRefNet-DIS-epoch_590.pth
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Model ----
+bb: swin_v1_l                # Swin-L backbone — must match the resume checkpoint's architecture.
+input_size: "1152x864"       # (W x H) = 1152 wide x 864 tall ⇒ exact 4:3, ~0.995MP; each side divisible by 32
+
+# ---- Dataset / split (must match between training and tools/report.py) ----
+csv_index: index.csv         # full interior dataset (data/interior_segmentation/index.csv), NOT the blob crops
+val_split: 0.2
+csv_split_seed: 42
+
+# ---- Experiment logging ----
+logger: both                 # one of: tensorboard | wandb | both | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir) = coarse-swin-l-4x3-1MP (auto-separated)
+wandb_entity: meero_rd       # W&B entity (team) name
+
+# ---- Metrics ----
+contour_radius: 4            # boundary-IoU ring half-width (px); same as the other coarse runs

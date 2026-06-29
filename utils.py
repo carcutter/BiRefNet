@@ -16,6 +16,12 @@ def path_to_image(path, size=(1024, 1024), color_type=['rgb', 'gray'][0]):
     else:
         print('Select the color_type to return, either to RGB or gray image.')
         return
+    if image is None:
+        # cv2.imread returns None for a missing/corrupt/zero-byte file. Fail with the offending
+        # path instead of a cryptic crash inside cv2.resize/cvtColor further down. The dataset
+        # filters missing pairs at construction, so reaching here means a present-but-unreadable
+        # file (e.g. a truncated download) — surface it loudly rather than train on garbage.
+        raise FileNotFoundError('cv2 could not read image (missing or corrupt): {}'.format(path))
     if size:
         image = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
     if color_type.lower() == 'rgb':
@@ -65,6 +71,56 @@ def path_to_binary_mask_nonbg(path, size=None, bg_colors=((0, 0, 0),)):
         bin_mask = cv2.resize(bin_mask, size, interpolation=cv2.INTER_LINEAR)
     return Image.fromarray(bin_mask).convert('L')
 
+
+
+def path_to_window_blob_map(path, size=None, fg_colors=((255, 0, 0), (0, 255, 0)),
+                            window_colors=((0, 0, 255),), ring_radius=12,
+                            window_frac=0.5, max_area_frac=0.2, min_area=64):
+    """Load an RGB color-coded mask and return an 'L' map (0/255) flagging foreground blobs
+    that are ISOLATED INSIDE A WINDOW region.
+
+    A pixel is 255 iff it belongs to a foreground (any `fg_colors`) connected component whose
+    surrounding `ring_radius`-px ring is at least `window_frac` window (any `window_colors`).
+    Components smaller than `min_area` px (noise) or larger than `max_area_frac` of the image
+    (the main interior body — not an isolated blob) are skipped.
+
+    Detection runs at native resolution (so blob topology and ring fractions are measured on the
+    true mask); the result is resized to `size` (W, H) with NEAREST so the 0/255 region stays crisp.
+    """
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(path)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    H, W = rgb.shape[:2]
+
+    fg = np.zeros((H, W), dtype=bool)
+    for c in fg_colors:
+        fg |= np.all(rgb == np.array(c, dtype=np.uint8), axis=-1)
+    win = np.zeros((H, W), dtype=bool)
+    for c in window_colors:
+        win |= np.all(rgb == np.array(c, dtype=np.uint8), axis=-1)
+
+    out = np.zeros((H, W), dtype=np.uint8)
+    if fg.any() and win.any():
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), connectivity=8)
+        k = 2 * int(ring_radius) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        area_cap = max_area_frac * H * W
+        for lab in range(1, n):
+            area = stats[lab, cv2.CC_STAT_AREA]
+            if area < min_area or area > area_cap:
+                continue
+            comp = (labels == lab).astype(np.uint8)
+            ring = (cv2.dilate(comp, kernel) > 0) & (comp == 0)
+            rs = int(ring.sum())
+            if rs == 0:
+                continue
+            if (ring & win).sum() / rs >= window_frac:
+                out[labels == lab] = 255
+
+    if size:
+        out = cv2.resize(out, size, interpolation=cv2.INTER_NEAREST)
+    return Image.fromarray(out).convert('L')
 
 
 def check_state_dict(state_dict, unwanted_prefixes=['module.', '_orig_mod.']):

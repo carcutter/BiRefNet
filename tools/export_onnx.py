@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import onnx
+from onnx import numpy_helper
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -377,6 +379,55 @@ def build_parser():
     return p
 
 
+_DEFORM_SCOPES = ('atrous_conv', 'dec_att')   # ASPPDeformable deform_conv2d decomposition
+
+
+def make_deform_batch_dynamic(model):
+    """Free the batch dim in the deform_conv2d (ASPPDeformable) decomposition.
+
+    The `deform_conv2d_onnx_exporter` decomposition reads the export-time batch (1) off the
+    input tensor and bakes it as a constant leading dim into its per-batch Reshapes
+    ([b, group, ch, h, w], [b, group, K, 2, h, w], and the rank-4 K*H*W flatten reshapes).
+    That makes the ONNX usable only at batch=1 even though `input` has a dynamic batch axis.
+
+    `b` is only ever a Reshape leading-dim (never arithmetic), so flipping that constant 1 -> -1
+    lets ONNX infer the batch at runtime — every other dim in those shapes is a concrete positive
+    int, so exactly one inferred dim per reshape. Scoped to the deform decomposition; flipping a
+    leading 1 is safe regardless (a genuine batch dim infers N; a batch-independent singleton
+    always infers 1). H/W stay static (the GatherND index math needs them). Returns #reshapes fixed.
+    """
+    g = model.graph
+    reshape_shapes = {
+        n.input[1] for n in g.node
+        if n.op_type == 'Reshape' and len(n.input) >= 2
+        and any(s in (n.name or '') for s in _DEFORM_SCOPES)
+    }
+    n_fixed = 0
+
+    def _flip(arr):
+        if arr.ndim == 1 and int(arr[0]) == 1 and not (arr < 0).any():
+            out = arr.copy()
+            out[0] = -1
+            return out
+        return None
+
+    for init in g.initializer:
+        if init.name in reshape_shapes:
+            new = _flip(numpy_helper.to_array(init))
+            if new is not None:
+                init.CopyFrom(numpy_helper.from_array(new, init.name))
+                n_fixed += 1
+    for n in g.node:
+        if n.op_type == 'Constant' and n.output and n.output[0] in reshape_shapes:
+            for a in n.attribute:
+                if a.name == 'value':
+                    new = _flip(numpy_helper.to_array(a.t))
+                    if new is not None:
+                        a.t.CopyFrom(numpy_helper.from_array(new))
+                        n_fixed += 1
+    return n_fixed
+
+
 def main():
     args = parse_args_with_yaml(build_parser)
     if not args.checkpoint:
@@ -438,6 +489,13 @@ def main():
                 dynamo=False,
             )
     print('wrote {}  ({:.1f} MB)'.format(out_path, out_path.stat().st_size / 1e6))
+
+    # The deform_conv2d decomposition bakes batch=1 into its Reshapes; free it so the dynamic
+    # input batch axis actually works (otherwise the model only runs at batch=1).
+    _m = onnx.load(str(out_path))
+    _n_fixed = make_deform_batch_dynamic(_m)
+    onnx.save(_m, str(out_path))
+    print('  made deform-conv batch dynamic: {} reshape dims -> -1'.format(_n_fixed))
 
     # Sidecar preprocessing manifest so downstream cannot drift.
     sidecar = {

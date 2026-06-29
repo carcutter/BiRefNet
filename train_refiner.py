@@ -81,12 +81,6 @@ def build_parser():
     p.add_argument('--w_contour_iou', default=1.0, type=float,
                    help='Weight of (1 - soft IoU) computed on the GT contour ring; pushes crisp edges.')
     p.add_argument('--contour_radius', default=2, type=int, help='Ring half-width for boundary loss + metric.')
-    p.add_argument('--w_locality', default=0.0, type=float,
-                   help='Weight of the locality penalty: predicted prob outside a dilation of the '
-                        'conditioning mask. 0=off. Suppresses far-from-mask hallucinations.')
-    p.add_argument('--locality_dilation', default=8, type=int,
-                   help='Dilation radius (px) of the conditioning mask defining the allowed region; '
-                        'predictions within this band of the mask are NOT penalized.')
     # ---- degradation knobs (override dataset_refiner.DEFAULT_DEGRADE_CFG) ----
     p.add_argument('--degrade_max_radius', default=DEFAULT_DEGRADE_CFG['max_radius'], type=int)
     p.add_argument('--degrade_max_down', default=DEFAULT_DEGRADE_CFG['max_down'], type=int)
@@ -94,14 +88,6 @@ def build_parser():
     p.add_argument('--degrade_downsample_prob', default=DEFAULT_DEGRADE_CFG['downsample_prob'], type=float)
     p.add_argument('--degrade_affine_prob', default=DEFAULT_DEGRADE_CFG['affine_prob'], type=float)
     p.add_argument('--degrade_noise_prob', default=DEFAULT_DEGRADE_CFG['noise_prob'], type=float)
-    p.add_argument('--degrade_spurious_prob', default=DEFAULT_DEGRADE_CFG['spurious_prob'], type=float,
-                   help='P(inject spurious far-from-GT blobs into the degraded mask) — false positives the '
-                        'refiner must erase (GT target stays clean). 0=off.')
-    p.add_argument('--degrade_spurious_max_blobs', default=DEFAULT_DEGRADE_CFG['spurious_max_blobs'], type=int)
-    p.add_argument('--degrade_spurious_min_radius', default=DEFAULT_DEGRADE_CFG['spurious_min_radius'], type=int)
-    p.add_argument('--degrade_spurious_max_radius', default=DEFAULT_DEGRADE_CFG['spurious_max_radius'], type=int)
-    p.add_argument('--degrade_spurious_margin', default=DEFAULT_DEGRADE_CFG['spurious_margin'], type=int,
-                   help='Min gap (px) between injected blobs and the true object.')
     # ---- logging ----
     p.add_argument('--logger', default='both', type=str,
                    help="Logging backend(s): tensorboard | wandb | mlflow | both (tb+wandb) | "
@@ -116,12 +102,7 @@ def make_degrade_cfg(args):
     return dict(DEFAULT_DEGRADE_CFG,
                 max_radius=args.degrade_max_radius, max_down=args.degrade_max_down,
                 morph_prob=args.degrade_morph_prob, downsample_prob=args.degrade_downsample_prob,
-                affine_prob=args.degrade_affine_prob, noise_prob=args.degrade_noise_prob,
-                spurious_prob=args.degrade_spurious_prob,
-                spurious_max_blobs=args.degrade_spurious_max_blobs,
-                spurious_min_radius=args.degrade_spurious_min_radius,
-                spurious_max_radius=args.degrade_spurious_max_radius,
-                spurious_margin=args.degrade_spurious_margin)
+                affine_prob=args.degrade_affine_prob, noise_prob=args.degrade_noise_prob)
 
 
 def reconstruct_prob(logits, cond_mask):
@@ -152,8 +133,7 @@ def refiner_loss(logits, gt, args, cond_mask=None):
 
     `w_bce` / `w_dice` / `w_boundary` / `w_contour_iou` are computed on the *reconstructed* refined
     mask vs GT (the boundary/contour terms live on the GT contour ring, exactly where the delta
-    concentrates) to keep edges crisp. `w_locality` penalizes refined foreground far from a dilation
-    of cond_mask.
+    concentrates) to keep edges crisp.
 
     Crop-only mode (cond_mask is None) has no coarse baseline to refine: it falls back to a direct
     sigmoid prediction and the w_delta term is inactive. The w_bce / w_dice / w_boundary /
@@ -185,21 +165,10 @@ def refiner_loss(logits, gt, args, cond_mask=None):
     contour_iou = (inter + eps) / (union + eps)
     contour_iou_loss = (1.0 - contour_iou).mean()
 
-    # Locality penalty — mean refined prob in the region outside the dilated conditioning mask.
-    locality = logits.new_zeros(())
-    if args.w_locality > 0 and cond_mask is not None:
-        d = int(args.locality_dilation)
-        m = (cond_mask > 0.5).float()                     # binarize the (soft) conditioning mask
-        allowed = F.max_pool2d(m, kernel_size=2 * d + 1, stride=1, padding=d)  # dilate by d px
-        outside = 1.0 - allowed
-        locality = (prob * outside).sum() / (outside.sum() + eps)
-
     total = (args.w_delta * delta + args.w_bce * bce + args.w_dice * dice
-             + args.w_boundary * boundary + args.w_contour_iou * contour_iou_loss
-             + args.w_locality * locality)
+             + args.w_boundary * boundary + args.w_contour_iou * contour_iou_loss)
     parts = {'delta': delta.item(), 'bce': bce.item(), 'dice': dice.item(),
-             'boundary': boundary.item(), 'contour_iou': contour_iou_loss.item(),
-             'locality': locality.detach().item()}
+             'boundary': boundary.item(), 'contour_iou': contour_iou_loss.item()}
     return total, parts, prob
 
 
@@ -317,8 +286,7 @@ def main():
                     'val_split': args.val_split, 'csv_split_seed': args.csv_split_seed,
                     'w_delta': args.w_delta, 'w_bce': args.w_bce, 'w_dice': args.w_dice,
                     'w_boundary': args.w_boundary,
-                    'w_contour_iou': args.w_contour_iou, 'w_locality': args.w_locality,
-                    'locality_dilation': args.locality_dilation,
+                    'w_contour_iou': args.w_contour_iou,
                     'degrade': degrade_cfg, 'smoke_test': args.smoke_test})
 
     # ---- best-checkpoint tracking ----
@@ -348,10 +316,10 @@ def main():
             running += loss.item()
             if bi % 50 == 0:
                 print('Epoch[{}/{}] Iter[{}/{}]  loss={:.4f}  delta={:.4f} bce={:.4f} dice={:.4f} '
-                      'boundary={:.4f} contour_iou={:.4f} locality={:.4f}'.format(
+                      'boundary={:.4f} contour_iou={:.4f}'.format(
                           epoch, args.epochs, bi, len(train_loader), loss.item(),
                           parts['delta'], parts['bce'], parts['dice'], parts['boundary'],
-                          parts['contour_iou'], parts['locality']))
+                          parts['contour_iou']))
             if exp_logger is not None:
                 exp_logger.add_scalar('Train/loss', loss.item(), global_step)
                 for k, v in parts.items():

@@ -44,13 +44,6 @@ DEFAULT_DEGRADE_CFG = {
     'scale_jitter': 0.05,   # ± fraction
     'noise_prob': 0.3,      # P(additive gaussian noise)
     'noise_std': 0.05,
-    # Spurious false positives — blobs pasted far from the true object that the refiner must
-    # learn to erase. OFF by default (prob 0) so existing configs are unaffected.
-    'spurious_prob': 0.0,       # P(inject spurious far-from-GT blobs into the degraded mask)
-    'spurious_max_blobs': 3,    # up to this many blobs per call when injecting
-    'spurious_min_radius': 4,   # blob radius range (px)
-    'spurious_max_radius': 24,
-    'spurious_margin': 16,      # min gap (px) from the true object: blobs land outside dilate(gt, margin)
 }
 
 
@@ -68,32 +61,6 @@ def _resolve_factory(csv_path, csv_image_root=None):
                 return cand
         return os.path.join(candidate_roots[0], rel)
     return _resolve
-
-
-def _inject_spurious_blobs(x, gt, cfg, rng):
-    """Paste up to cfg['spurious_max_blobs'] filled disks into the degraded mask `x`, placed
-    strictly outside a `spurious_margin`-px dilation of the GT — i.e. false positives the refiner
-    must learn to erase. The GT target is left untouched (only the input channel gets these).
-
-    x:  (1, 1, H, W) soft mask in [0,1] (modified by union).
-    gt: (1, H, W) binary GT, used only to compute the keep-away region.
-    """
-    H, W = x.shape[-2:]
-    m = int(cfg['spurious_margin'])
-    near = F.max_pool2d(gt.unsqueeze(0), kernel_size=2 * m + 1, stride=1, padding=m)  # dilated GT
-    far_hw = (near[0, 0] <= 0.5).float()                  # (H,W) — valid placement area
-    far_idx = torch.nonzero(far_hw, as_tuple=False)       # (K,2) [y,x]
-    if far_idx.shape[0] == 0:
-        return x                                          # GT fills the crop — nowhere safe to place
-    yy = torch.arange(H).view(H, 1)
-    xx = torch.arange(W).view(1, W)
-    rmin, rmax = int(cfg['spurious_min_radius']), int(cfg['spurious_max_radius'])
-    for _ in range(rng.randint(1, int(cfg['spurious_max_blobs']))):
-        cy, cx = (int(v) for v in far_idx[rng.randrange(far_idx.shape[0])])
-        rb = rng.randint(rmin, rmax)
-        disk = ((yy - cy) ** 2 + (xx - cx) ** 2 <= rb * rb).float() * far_hw  # never spill into GT margin
-        x = torch.maximum(x, disk.view(1, 1, H, W))
-    return x
 
 
 def degrade_mask(gt, cfg, rng, gen=None):
@@ -125,11 +92,6 @@ def degrade_mask(gt, cfg, rng, gen=None):
             x = F.max_pool2d(x, kernel_size=k, stride=1, padding=r)            # dilation
         else:
             x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=r)          # erosion
-
-    # 2.5 Spurious false positives — blobs far from the true object the refiner must erase. Injected
-    #     before the blur/noise steps so they get softened like a real coarse prediction would be.
-    if cfg.get('spurious_prob', 0.0) and rng.random() < cfg['spurious_prob']:
-        x = _inject_spurious_blobs(x, gt, cfg, rng)
 
     # 3. Resolution loss — downsample then upsample to soften/blur the boundary.
     if rng.random() < cfg['downsample_prob']:

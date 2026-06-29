@@ -1,6 +1,7 @@
 import os
 import sys
 import math
+import shutil
 import datetime
 from contextlib import nullcontext
 import argparse
@@ -109,6 +110,21 @@ def build_parser():
                    help='Backbone override (e.g. swin_v1_l for the general-resolution checkpoint, '
                         'swin_v1_b for the DIS/interior ones). Must match the resume checkpoint\'s '
                         'architecture. Exported as BIREFNET_BB before Config is built.')
+    p.add_argument('--num_workers', default=8, type=int,
+                   help='DataLoader worker processes for the train/val loaders (capped at os.cpu_count()). '
+                        'Overrides the batch-size-derived default. Smoke runs force 0.')
+    p.add_argument('--val_vis_num_samples', default=16, type=int,
+                   help='How many validation samples to dump as input/pred/gt PNGs per validation '
+                        '(the first N in val order). 0 disables. Only the LATEST validated epoch is '
+                        'kept on disk (val_vis/epoch_<n>); prior epochs are removed. Metrics still '
+                        'run on the full val set.')
+    p.add_argument('--window_blob_loss', default=False, type=lambda x: str(x).lower() == 'true',
+                   help='Upweight the BCE on FG (red/green) blobs isolated inside window (blue) regions. '
+                        'The dataset emits a 0/1 weight map; PixLoss applies a weighted BCE there. '
+                        'Detection params live in config.py (window_blob_*).')
+    p.add_argument('--window_blob_loss_weight', default=5.0, type=float,
+                   help='Multiplier k for the window-blob weighted BCE: flagged pixels count k× '
+                        '(weight = 1 + (k-1)*map). Only used when --window_blob_loss is set.')
     return p
 
 
@@ -145,6 +161,8 @@ if args.batch_size is not None:
     config.lr *= math.sqrt(args.batch_size / config.batch_size)
     config.num_workers = max(4, args.batch_size)
     config.batch_size = args.batch_size
+# Explicit --num_workers wins over the batch-size-derived value above (smoke still forces 0 below).
+config.num_workers = args.num_workers
 if args.smoke_test:
     # Smoke runs should validate the pipeline, not the slow paths.
     config.compile = False
@@ -212,16 +230,21 @@ print('batch size:', config.batch_size)
 from dataset import custom_collate_fn
 
 def prepare_dataloader(dataset: torch.utils.data.Dataset, batch_size: int, to_be_distributed=False, is_train=True):
-    # Prepare dataloaders
+    # Prepare dataloaders. Worker count tracks config.num_workers (capped at CPU cores) — NOT the
+    # batch size, which would throttle small-batch / big-model runs (e.g. Swin-L @1024, bs=2) and
+    # starve the GPU. persistent_workers keeps the pool alive across epochs when workers > 0.
+    nw = min(config.num_workers, os.cpu_count() or config.num_workers)
     if to_be_distributed:
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, num_workers=min(config.num_workers, batch_size), pin_memory=True,
-            shuffle=False, sampler=DistributedSampler(dataset), drop_last=True, collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
+            dataset=dataset, batch_size=batch_size, num_workers=nw, pin_memory=True,
+            shuffle=False, sampler=DistributedSampler(dataset), drop_last=True, persistent_workers=nw > 0,
+            collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
         )
     else:
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, num_workers=min(config.num_workers, batch_size), pin_memory=True,
-            shuffle=is_train, sampler=None, drop_last=True, collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
+            dataset=dataset, batch_size=batch_size, num_workers=nw, pin_memory=True,
+            shuffle=is_train, sampler=None, drop_last=True, persistent_workers=nw > 0,
+            collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
         )
 
 
@@ -247,6 +270,7 @@ def init_data_loaders(to_be_distributed):
                 csv_image_root=config.csv_image_root,
                 val_split=config.val_split,
                 csv_split_seed=config.csv_split_seed,
+                window_blob_loss=args.window_blob_loss,
             )
             train_source_str = '{} (rng split, seed={}, val={})'.format(
                 index_csv, config.csv_split_seed, config.val_split)
@@ -258,6 +282,7 @@ def init_data_loaders(to_be_distributed):
                 is_train=True,
                 csv_path=train_csv,
                 csv_image_root=config.csv_image_root,
+                window_blob_loss=args.window_blob_loss,
             )
             train_source_str = train_csv
         train_loader = prepare_dataloader(train_dataset, config.batch_size, to_be_distributed=to_be_distributed, is_train=True)
@@ -292,10 +317,11 @@ def init_data_loaders(to_be_distributed):
                 val_dataset = None
             if val_dataset is not None:
                 # Plain (un-distributed) loader: validation runs only on the main process.
+                _val_nw = min(config.num_workers, os.cpu_count() or config.num_workers)
                 val_loader = torch.utils.data.DataLoader(
                     dataset=val_dataset, batch_size=config.batch_size_valid,
-                    num_workers=min(config.num_workers, config.batch_size_valid),
-                    pin_memory=True, shuffle=False, drop_last=False,
+                    num_workers=_val_nw, pin_memory=True, shuffle=False, drop_last=False,
+                    persistent_workers=_val_nw > 0,
                 )
                 print(len(val_loader), "batches of val dataloader from {} have been created.".format(val_source_str))
         return train_loader, val_loader
@@ -431,9 +457,16 @@ class Trainer:
         was_training = model.training
         model.eval()
 
-        vis_dir = os.path.join(args.ckpt_dir, 'val_vis', 'epoch_{}'.format(epoch))
+        # Keep only the LATEST validated epoch's visualizations: wipe the whole val_vis tree
+        # (train.py owns it — it holds nothing but these epoch dirs) before writing this epoch's.
+        n_vis = max(0, int(args.val_vis_num_samples))
+        vis_root = os.path.join(args.ckpt_dir, 'val_vis')
+        if os.path.isdir(vis_root):
+            shutil.rmtree(vis_root, ignore_errors=True)
+        vis_dir = os.path.join(vis_root, 'epoch_{}'.format(epoch))
         os.makedirs(vis_dir, exist_ok=True)
-        logger.info('Validation @ epoch {}: writing batch/predictions to {}'.format(epoch, vis_dir))
+        logger.info('Validation @ epoch {}: writing up to {} sample viz to {} (latest epoch only)'.format(
+            epoch, n_vis, vis_dir))
 
         mixed_precision = config.mixed_precision
         if mixed_precision == 'fp16':
@@ -482,7 +515,11 @@ class Trainer:
             if first_batch_tb is None:
                 first_batch_tb = (inputs_denorm.clone(), preds_cpu.clone(), gts_cpu.clone())
 
+            # Only dump the first n_vis samples (val order is deterministic — shuffle=False — so the
+            # saved subset is the same images every epoch, good for side-by-side visual comparison).
             for i in range(inputs.shape[0]):
+                if sample_idx >= n_vis:
+                    break
                 stem = os.path.splitext(os.path.basename(label_paths[i]))[0]
                 tag = '{:03d}_{}'.format(sample_idx, stem)
                 save_tensor_img(inputs_denorm[i:i+1], os.path.join(vis_dir, '{}_input.png'.format(tag)))
@@ -517,10 +554,12 @@ class Trainer:
             inputs = batch[0]#.to(device)
             gts = batch[1]#.to(device)
             class_labels = batch[2]#.to(device)
+            weight_map = batch[3] if len(batch) > 3 else None   # window-blob loss weight map
         else:
             inputs = batch[0].to(device)
             gts = batch[1].to(device)
             class_labels = batch[2].to(device)
+            weight_map = batch[3].to(device) if len(batch) > 3 else None
         self.optimizer.zero_grad()
         scaled_preds, class_preds_lst = self.model(inputs)
         if config.out_ref:
@@ -537,7 +576,9 @@ class Trainer:
             self.loss_dict['loss_cls'] = loss_cls.item()
 
         # Loss
-        loss_pix, loss_dict_pix = self.pix_loss(scaled_preds, torch.clamp(gts, 0, 1), pix_loss_lambda=1.0)
+        loss_pix, loss_dict_pix = self.pix_loss(
+            scaled_preds, torch.clamp(gts, 0, 1), pix_loss_lambda=1.0,
+            weight_map=weight_map, weight_k=args.window_blob_loss_weight)
         self.loss_dict.update(loss_dict_pix)
         self.loss_dict['loss_pix'] = loss_pix.item()
         # since there may be several losses for sal, the lambdas for them (lambdas_pix) are inside the loss.py

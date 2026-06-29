@@ -44,6 +44,20 @@ class Config():
         self.mask_bg_colors = ((0, 0, 0), (0, 0, 255))      # used when mode == 'nonbg': black + blue are bg
         self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))    # used when mode == 'colors': red + green are fg
 
+        # --- Window-blob loss ---------------------------------------------------------------
+        # Upweight the BCE on foreground (red/green) connected components that sit ISOLATED
+        # inside a window (blue) region — i.e. a FG blob whose surrounding ring is mostly window.
+        # These are small interior objects seen within a window that the model tends to drop.
+        # The dataset emits a 0/1 weight map flagging those blobs; PixLoss then uses a weighted
+        # BCE  weight = 1 + (k-1)*map  (so flagged pixels count k× — k = window_blob_loss_weight).
+        # OFF by default; enabled per-run via train.py --window_blob_loss (these are detection
+        # params, read by MyData; the multiplier k is passed straight to PixLoss from the CLI).
+        self.window_blob_window_colors = ((0, 0, 255),)    # 'window' colors (blue)
+        self.window_blob_ring_radius = 12                  # px ring around a FG blob tested for window
+        self.window_blob_window_frac = 0.5                 # ring must be >= this fraction window to qualify
+        self.window_blob_max_area_frac = 0.2               # ignore FG comps larger than this frac of the image
+        self.window_blob_min_area = 64                     # ignore FG comps smaller than this many px (noise)
+
         # TASK settings
         self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][3]
         self.testsets = {

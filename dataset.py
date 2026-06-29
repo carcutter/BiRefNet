@@ -10,7 +10,7 @@ from torchvision import transforms
 
 from image_proc import preproc
 from config import Config
-from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg
+from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg, path_to_window_blob_map
 
 
 Image.MAX_IMAGE_PIXELS = None       # remove DecompressionBombWarning
@@ -36,7 +36,7 @@ class_labels_TR_sorted = _class_labels_TR_sorted.split(', ')
 
 class MyData(data.Dataset):
     def __init__(self, datasets, data_size, is_train=True, csv_path=None, csv_image_root=None,
-                 max_samples=0, val_split=0.0, csv_split_seed=42):
+                 max_samples=0, val_split=0.0, csv_split_seed=42, window_blob_loss=False):
         # data_size is None when using dynamic_size or data_size is manually set to None (for inference in the original size).
         # csv_path: if set, load (image_path, mask_path) pairs from a CSV with those columns.
         #           Paths inside the CSV resolve against csv_image_root (defaults to the CSV's
@@ -49,6 +49,17 @@ class MyData(data.Dataset):
         self.data_size = data_size
         self.load_all = config.load_all
         self.device = config.device
+        # Window-blob loss: emit a 0/1 weight map flagging FG blobs isolated inside window regions.
+        # Train-only; detection params come from config (see config.py:window_blob_*). The multiplier
+        # k is applied later in PixLoss (passed from the CLI), not here.
+        self.window_blob_loss = bool(window_blob_loss) and is_train
+        if self.window_blob_loss:
+            if self.load_all:
+                raise SystemExit('window_blob_loss is not supported with config.load_all=True '
+                                 '(weight maps are computed per-__getitem__, not preloaded).')
+            if config.dynamic_size is not None:
+                raise SystemExit('window_blob_loss is not supported with config.dynamic_size '
+                                 '(the weight map is resized in __getitem__, not in custom_collate_fn).')
         valid_extensions = ['.png', '.jpg', '.PNG', '.JPG', '.JPEG']
 
         if self.is_train and config.auxiliary_classification:
@@ -98,6 +109,18 @@ class MyData(data.Dataset):
                 val_idx = set(idx[:n_val].tolist())
                 keep = (lambda i: i not in val_idx) if is_train else (lambda i: i in val_idx)
                 pairs = [p for i, p in enumerate(pairs) if keep(i)]
+
+            # Drop pairs whose image or mask is missing on disk (e.g. an un-pulled DVC subset such
+            # as kw2607_boat). Done AFTER the split so the deterministic split membership of the
+            # PRESENT samples is identical regardless of which subsets happen to be on disk —
+            # only the missing entries are removed. Prevents a 5%-of-index missing dataset from
+            # crashing a long run when a worker draws one (cv2.imread → None).
+            _present = [(im, mk) for (im, mk) in pairs if os.path.isfile(im) and os.path.isfile(mk)]
+            _n_dropped = len(pairs) - len(_present)
+            if _n_dropped:
+                print('[MyData] dropped {}/{} {} pairs with a missing image/mask on disk.'.format(
+                    _n_dropped, len(pairs), 'train' if is_train else 'val'))
+            pairs = _present
 
             self.image_paths = [p[0] for p in pairs]
             self.label_paths = [p[1] for p in pairs]
@@ -168,6 +191,17 @@ class MyData(data.Dataset):
             label = self._load_label(self.label_paths[index])
             class_label = self.cls_name2id[self.label_paths[index].split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
 
+        # Window-blob loss weight map (train only): flag FG blobs isolated inside window regions.
+        # Loaded at the same data_size as image/label so it stays aligned through preproc+ToTensor.
+        weight = None
+        if self.window_blob_loss:
+            weight = path_to_window_blob_map(
+                self.label_paths[index], size=self.data_size,
+                fg_colors=config.mask_fg_colors, window_colors=config.window_blob_window_colors,
+                ring_radius=config.window_blob_ring_radius, window_frac=config.window_blob_window_frac,
+                max_area_frac=config.window_blob_max_area_frac, min_area=config.window_blob_min_area,
+            )
+
         # loading image and label
         if self.is_train:
             if config.background_color_synthesis:
@@ -194,7 +228,10 @@ class MyData(data.Dataset):
                         array_background[:, :, idx_channel] = random.randint(0, 255)
                 array_foreground_background = array_foreground * array_mask + array_background * (1 - array_mask)
                 image = Image.fromarray(array_foreground_background.astype(np.uint8))
-            image, label = preproc(image, label, preproc_methods=config.preproc_methods)
+            if weight is None:
+                image, label = preproc(image, label, preproc_methods=config.preproc_methods)
+            else:
+                image, label, weight = preproc(image, label, preproc_methods=config.preproc_methods, weight=weight)
         # else:
         #     if _label.shape[0] > 2048 or _label.shape[1] > 2048:
         #         _image = cv2.resize(_image, (2048, 2048), interpolation=cv2.INTER_LINEAR)
@@ -204,6 +241,8 @@ class MyData(data.Dataset):
         if self.is_train:
             if config.dynamic_size is None:
                 image, label = self.transform_image(image), self.transform_label(label)
+                if weight is not None:
+                    weight = self.transform_label(weight)   # ToTensor → (1,H,W) in [0,1]
         else:
             size_div_32 = (int(image.size[0] // 32 * 32), int(image.size[1] // 32 * 32))
             if image.size != size_div_32:
@@ -212,6 +251,8 @@ class MyData(data.Dataset):
             image, label = self.transform_image(image), self.transform_label(label)
 
         if self.is_train:
+            if weight is not None:
+                return image, label, class_label, weight
             return image, label, class_label
         else:
             return image, label, self.label_paths[index]

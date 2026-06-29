@@ -104,28 +104,36 @@ def refine_foreground(image, mask, r=90, device='cuda'):
     return estimated_foreground
 
 
-def preproc(image, label, preproc_methods=['flip']):
+def preproc(image, label, preproc_methods=['flip'], weight=None):
+    # `weight` is an optional extra label-aligned PIL map (e.g. the window-blob loss-weight map).
+    # It rides the same GEOMETRIC ops as the label (flip/crop/rotate) so it stays pixel-aligned;
+    # the image-only ops (enhance/blur) leave it untouched. Returns (image, label) when weight is
+    # None, else (image, label, weight) — so existing 2-arg callers are unaffected.
     if 'flip' in preproc_methods:
-        image, label = cv_random_flip(image, label)
+        image, label, weight = cv_random_flip(image, label, weight)
     if 'crop' in preproc_methods:
-        image, label = random_crop(image, label)
+        image, label, weight = random_crop(image, label, weight)
     if 'rotate' in preproc_methods:
-        image, label = random_rotate(image, label)
+        image, label, weight = random_rotate(image, label, weight)
     if 'enhance' in preproc_methods:
         image = color_enhance(image)
     if 'blur' in preproc_methods:
         image = random_blur(image)
-    return image, label
+    if weight is None:
+        return image, label
+    return image, label, weight
 
 
-def cv_random_flip(img, label):
+def cv_random_flip(img, label, weight=None):
     if random.random() > 0.5:
         img = img.transpose(Image.FLIP_LEFT_RIGHT)
         label = label.transpose(Image.FLIP_LEFT_RIGHT)
-    return img, label
+        if weight is not None:
+            weight = weight.transpose(Image.FLIP_LEFT_RIGHT)
+    return img, label, weight
 
 
-def random_crop(image, label):
+def random_crop(image, label, weight=None):
     border = 30
     image_width = image.size[0]
     image_height = image.size[1]
@@ -135,16 +143,21 @@ def random_crop(image, label):
     random_region = (
         (image_width - crop_win_width) >> 1, (image_height - crop_win_height) >> 1, (image_width + crop_win_width) >> 1,
         (image_height + crop_win_height) >> 1)
-    return image.crop(random_region), label.crop(random_region)
+    if weight is not None:
+        weight = weight.crop(random_region)
+    return image.crop(random_region), label.crop(random_region), weight
 
 
-def random_rotate(image, label, angle=15):
+def random_rotate(image, label, weight=None, angle=15):
     mode = Image.BICUBIC
     if random.random() > 0.8:
         random_angle = np.random.randint(-angle, angle)
         image = image.rotate(random_angle, mode)
         label = label.rotate(random_angle, mode)
-    return image, label
+        if weight is not None:
+            # NEAREST keeps the weight map a clean 0/255 region (no interpolated grey at edges).
+            weight = weight.rotate(random_angle, Image.NEAREST)
+    return image, label, weight
 
 
 def color_enhance(image):

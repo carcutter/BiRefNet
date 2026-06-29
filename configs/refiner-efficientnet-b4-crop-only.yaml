@@ -44,7 +44,7 @@ degrade_max_down: 8
 degrade_morph_prob: 0.8
 degrade_downsample_prob: 0.8
 degrade_affine_prob: 0.4
-degrade_noise_prob: 0.3
+degrade_noise_prob: 0.0      # disabled — no additive Gaussian noise (would speckle the solid white interior)
 
 # ---- experiment logging ----
 logger: both                 # tensorboard | wandb | mlflow | both (tb+wandb) | all (tb+wandb+mlflow) | none
