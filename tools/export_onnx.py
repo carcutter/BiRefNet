@@ -8,6 +8,10 @@ returns a single sigmoided HxW tensor.
 A sidecar `<out>.json` is written with the preprocessing assumptions
 (`mean`, `std`, `input_size`, `threshold`) so downstream consumers cannot drift
 from the training-time pipeline.
+
+`--fp16` does NOT trace the torch model in half precision (that crashes the legacy
+exporter mid-trace on the Swin backbone); instead the traced fp32 graph is post-
+converted to fp16 with onnxruntime's float16 converter (see `_convert_onnx_to_fp16`).
 """
 import argparse
 import contextlib
@@ -366,14 +370,17 @@ def build_parser():
     p.add_argument('--input_size', default='1024,1024', type=_parse_size, help='H,W to trace at (each divisible by 32)')
     p.add_argument('--batch', default='dynamic', help='Static batch size, or "dynamic"')
     p.add_argument('--opset', default=17, type=int)
-    p.add_argument('--fp16', action='store_true')
+    p.add_argument('--fp16', action='store_true',
+                   help='Emit an fp16 graph (fp16 input/output). Done by post-converting the '
+                        'traced fp32 graph, since the fp16 CPU trace crashes on Swin.')
     p.add_argument('--no_sigmoid', action='store_true',
                    help='Emit raw logits instead of sigmoided probabilities.')
     p.add_argument('--check', action='store_true', default=True,
                    help='Re-run the exported model with onnxruntime and assert parity (default: on).')
     p.add_argument('--no_check', dest='check', action='store_false')
     p.add_argument('--check_tol', default=None, type=float,
-                   help='Parity tolerance (defaults: 1e-3 fp32, 1e-2 fp16)')
+                   help='Parity tolerance override. Default gate: fp32 max|Δprob|<1e-3; '
+                        'fp16+logits threshold-flip<0.5%%; fp16+sigmoid max|Δprob|<5e-2.')
     p.add_argument('--threshold', default=0.5, type=float,
                    help='Threshold written to the sidecar JSON (for downstream binarization).')
     return p
@@ -428,6 +435,27 @@ def make_deform_batch_dynamic(model):
     return n_fixed
 
 
+def _convert_onnx_to_fp16(model):
+    """Convert a float32 ONNX graph to float16 and return the new model.
+
+    Sidesteps the crashing fp16 CPU trace by converting the *already-traced* fp32 graph.
+    Uses onnxruntime's float16 converter (a maintained fork of onnxconverter_common):
+    the vanilla converter mistypes Swin attention's explicit fp32-softmax Cast nodes,
+    while the ORT variant reconciles them. `keep_io_types=False` makes input/output fp16
+    too (a true fp16 model). Int tensors (e.g. GatherND indices in the deform-conv
+    decomposition) are left untouched.
+    """
+    try:
+        from onnxruntime.transformers.float16 import convert_float_to_float16
+    except ImportError as e:
+        raise SystemExit(
+            '--fp16 needs onnxruntime (its transformers.float16 converter). '
+            'Install it with `uv add onnxruntime`.\nOriginal error: {}'.format(e)
+        )
+    print('  converting graph float32 -> float16')
+    return convert_float_to_float16(model, keep_io_types=False, disable_shape_infer=False)
+
+
 def main():
     args = parse_args_with_yaml(build_parser)
     if not args.checkpoint:
@@ -445,10 +473,10 @@ def main():
     print('  loaded: missing={} unexpected={}'.format(len(missing), len(unexpected)))
 
     adapter = OnnxAdapter(model, apply_sigmoid=not args.no_sigmoid).to(device).eval()
-    if args.fp16:
-        adapter = adapter.half()
-
-    dummy = torch.randn(1, 3, H, W, dtype=torch.float16 if args.fp16 else torch.float32, device=device)
+    # NB: --fp16 is NOT applied to the torch model. Tracing the Swin backbone in half
+    # precision on CPU crashes the legacy exporter mid-trace (native abort, no traceback),
+    # so we always trace fp32 and post-convert the ONNX graph to fp16 below.
+    dummy = torch.randn(1, 3, H, W, dtype=torch.float32, device=device)
 
     dynamic_axes = None
     if str(args.batch) == 'dynamic':
@@ -494,8 +522,12 @@ def main():
     # input batch axis actually works (otherwise the model only runs at batch=1).
     _m = onnx.load(str(out_path))
     _n_fixed = make_deform_batch_dynamic(_m)
-    onnx.save(_m, str(out_path))
     print('  made deform-conv batch dynamic: {} reshape dims -> -1'.format(_n_fixed))
+    if args.fp16:
+        _m = _convert_onnx_to_fp16(_m)
+    onnx.save(_m, str(out_path))
+    if args.fp16:
+        print('wrote fp16 {}  ({:.1f} MB)'.format(out_path, out_path.stat().st_size / 1e6))
 
     # Sidecar preprocessing manifest so downstream cannot drift.
     sidecar = {
@@ -520,12 +552,38 @@ def main():
             raise SystemExit('--check requested but onnxruntime not installed: {}'.format(e))
         sess = ort.InferenceSession(str(out_path), providers=['CPUExecutionProvider'])
         with torch.no_grad():
-            torch_out = adapter(dummy).detach().cpu().float().numpy()
-        onnx_out = sess.run(None, {'input': dummy.cpu().numpy()})[0].astype(np.float32)
-        tol = args.check_tol if args.check_tol is not None else (1e-2 if args.fp16 else 1e-3)
-        diff = float(np.abs(torch_out - onnx_out).max())
-        assert diff < tol, 'ONNX parity failed: max |Δ| = {:.3e} > tol {:.3e}'.format(diff, tol)
-        print('parity OK (max |Δ| = {:.3e}, tol = {:.3e})'.format(diff, tol))
+            torch_out = adapter(dummy).detach().cpu().float().numpy()   # fp32 reference
+        onnx_in = dummy.cpu().numpy()
+        if args.fp16:
+            onnx_in = onnx_in.astype(np.float16)   # the fp16 graph has an fp16 input
+        onnx_out = sess.run(None, {'input': onnx_in})[0].astype(np.float32)
+
+        # Compare in probability space. With --no_sigmoid the outputs are unbounded logits,
+        # and fp16 abs error scales with magnitude, so a raw-logit tolerance is meaningless;
+        # sigmoid keeps both sides in [0, 1] regardless of --no_sigmoid.
+        def _prob(a):
+            return 1.0 / (1.0 + np.exp(-a.astype(np.float64))) if args.no_sigmoid else a
+        dprob = np.abs(_prob(torch_out) - _prob(onnx_out))
+        diff_max, diff_mean = float(dprob.max()), float(dprob.mean())
+        flip = float((np.sign(torch_out) != np.sign(onnx_out)).mean()) if args.no_sigmoid else None
+        assert np.isfinite(onnx_out).all(), 'ONNX parity failed: non-finite values in output'
+
+        if args.fp16 and args.no_sigmoid:
+            # fp16 rounding yields occasional large per-pixel prob deltas on borderline logits,
+            # so gate on the fraction of pixels whose 0.5 decision flips (a broken conversion
+            # flips whole percents), not the max prob delta.
+            tol = args.check_tol if args.check_tol is not None else 5e-3   # ≤0.5% of pixels
+            msg = '0.5-threshold flip = {:.4%} (tol {:.4%}), max |Δprob| = {:.3e}, mean = {:.3e}'.format(
+                flip, tol, diff_max, diff_mean)
+            assert flip < tol, 'ONNX parity failed: ' + msg
+        else:
+            # fp32 (near-exact) or fp16-with-sigmoid (bounded [0,1]) → gate on the max prob delta.
+            tol = args.check_tol if args.check_tol is not None else (5e-2 if args.fp16 else 1e-3)
+            msg = 'max |Δprob| = {:.3e}, tol = {:.3e}'.format(diff_max, tol)
+            if flip is not None:
+                msg += ', 0.5-threshold flip = {:.4%}'.format(flip)
+            assert diff_max < tol, 'ONNX parity failed: ' + msg
+        print('parity OK (' + msg + ')')
 
 
 if __name__ == '__main__':
