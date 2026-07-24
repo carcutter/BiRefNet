@@ -164,7 +164,7 @@ class Config():
         ][0]
 
         # TRAINING settings - inactive
-        self.preproc_methods = ['flip', 'enhance', 'rotate', 'blur', 'crop'][:4 if not self.background_color_synthesis else 1]
+        self.preproc_methods = ['flip', 'enhance', 'rotate', 'blur', 'crop'][:5 if not self.background_color_synthesis else 1]
         self.optimizer = ['Adam', 'AdamW'][1]
         self.lr_decay_epochs = [1e5]    # Set to negative N to decay the lr in the last N-th epoch.
         self.lr_decay_rate = 0.5

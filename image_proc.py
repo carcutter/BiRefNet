@@ -133,19 +133,28 @@ def cv_random_flip(img, label, weight=None):
     return img, label, weight
 
 
-def random_crop(image, label, weight=None):
-    border = 30
-    image_width = image.size[0]
-    image_height = image.size[1]
-    border = int(min(image_width, image_height) * 0.1)
-    crop_win_width = np.random.randint(image_width - border, image_width)
-    crop_win_height = np.random.randint(image_height - border, image_height)
-    random_region = (
-        (image_width - crop_win_width) >> 1, (image_height - crop_win_height) >> 1, (image_width + crop_win_width) >> 1,
-        (image_height + crop_win_height) >> 1)
+def random_crop(image, label, weight=None, prob=0.2, min_scale=0.5):
+    """Random-zoom crop. With probability `prob`, take a random-position window whose size is a
+    random fraction in [`min_scale`, 1.0] of each side (i.e. crop away up to 1-min_scale of the
+    frame), then resize the window back to the original size. Resizing back is required: the batch
+    is fixed-resolution (config.size), so a raw crop of varying size would break collation.
+
+    Geometric — image, label and (optional) weight map are cropped from the same box and resized
+    together. Image uses bilinear; label/weight use nearest to keep the mask crisp.
+    """
+    if random.random() >= prob:
+        return image, label, weight
+    W, H = image.size
+    cw = random.randint(int(round(min_scale * W)), W)
+    ch = random.randint(int(round(min_scale * H)), H)
+    x0 = random.randint(0, W - cw)
+    y0 = random.randint(0, H - ch)
+    box = (x0, y0, x0 + cw, y0 + ch)
+    image = image.crop(box).resize((W, H), Image.BILINEAR)
+    label = label.crop(box).resize((W, H), Image.NEAREST)
     if weight is not None:
-        weight = weight.crop(random_region)
-    return image.crop(random_region), label.crop(random_region), weight
+        weight = weight.crop(box).resize((W, H), Image.NEAREST)
+    return image, label, weight
 
 
 def random_rotate(image, label, weight=None, angle=15):
@@ -185,9 +194,9 @@ def random_gaussian(image, mean=0.1, sigma=0.35):
     return Image.fromarray(np.uint8(img))
 
 
-def random_blur(image, prob=0.2, radius_range=(0.4, 1.2)):
+def random_blur(image, prob=0.15, radius_range=(0.1, 0.5)):
     # Light Gaussian blur to mimic mild defocus / soft optics. Applied with `prob` probability
-    # only to the image (not the label). Radius is kept small so edges stay learnable.
+    # only to the image (not the label). Radius kept low-intensity so edges stay learnable.
     if random.random() < prob:
         radius = random.uniform(*radius_range)
         image = image.filter(ImageFilter.GaussianBlur(radius=radius))

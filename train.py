@@ -113,6 +113,18 @@ def build_parser():
     p.add_argument('--num_workers', default=8, type=int,
                    help='DataLoader worker processes for the train/val loaders (capped at os.cpu_count()). '
                         'Overrides the batch-size-derived default. Smoke runs force 0.')
+    p.add_argument('--early_stop_patience', default=0, type=int,
+                   help='Early stop if Val/Contour_mIoU does not improve for this many consecutive '
+                        'validations (0 = disabled). Requires validation to be enabled. The best '
+                        'checkpoint is always saved to <ckpt_dir>/best.pth when the metric improves.')
+    p.add_argument('--early_stop_min_delta', default=0.0, type=float,
+                   help='Minimum Val/Contour_mIoU increase to count as an improvement for early stopping.')
+    p.add_argument('--save_step', default=None, type=int,
+                   help='Save a per-epoch checkpoint every N epochs (overrides config.save_step). '
+                        'Combine with --save_last to control the cadence over the whole run.')
+    p.add_argument('--save_last', default=None, type=int,
+                   help='Only save per-epoch checkpoints within the last N epochs (overrides '
+                        'config.save_last). Set >= total epochs to checkpoint across the entire run.')
     p.add_argument('--val_vis_num_samples', default=16, type=int,
                    help='How many validation samples to dump as input/pred/gt PNGs per validation '
                         '(the first N in val order). 0 disables. Only the LATEST validated epoch is '
@@ -163,6 +175,11 @@ if args.batch_size is not None:
     config.batch_size = args.batch_size
 # Explicit --num_workers wins over the batch-size-derived value above (smoke still forces 0 below).
 config.num_workers = args.num_workers
+# Checkpoint cadence overrides (smoke block below still forces save_last=epochs, save_step=1).
+if args.save_step is not None:
+    config.save_step = args.save_step
+if args.save_last is not None:
+    config.save_last = args.save_last
 if args.smoke_test:
     # Smoke runs should validate the pipeline, not the slow paths.
     config.compile = False
@@ -527,16 +544,21 @@ class Trainer:
                 save_tensor_img(gts_cpu[i:i+1], os.path.join(vis_dir, '{}_gt.png'.format(tag)))
                 sample_idx += 1
 
+        n = agg['count']
+        contour_miou = (agg['contour_miou'] / n) if n > 0 else None
+
+        # Always surface the val metrics in the log (needed for early stopping even with --logger none).
+        if n > 0:
+            logger.info('Val @ epoch {}: loss={:.4f}  IoU={:.4f}  F1={:.4f}  MAE={:.4f}  Contour_mIoU={:.4f}  (n={})'.format(
+                epoch, agg['loss'] / n, agg['iou'] / n, agg['f1'] / n, agg['mae'] / n, contour_miou, n))
+
         # TensorBoard: epoch-level val scalars + image panel.
-        if self.exp_logger is not None and agg['count'] > 0:
-            n = agg['count']
+        if self.exp_logger is not None and n > 0:
             self.exp_logger.add_scalar('Val/loss', agg['loss'] / n, epoch, axis='epoch')
             self.exp_logger.add_scalar('Val/IoU', agg['iou'] / n, epoch, axis='epoch')
             self.exp_logger.add_scalar('Val/F1', agg['f1'] / n, epoch, axis='epoch')
             self.exp_logger.add_scalar('Val/MAE', agg['mae'] / n, epoch, axis='epoch')
-            self.exp_logger.add_scalar('Val/Contour_mIoU', agg['contour_miou'] / n, epoch, axis='epoch')
-            logger.info('Val @ epoch {}: loss={:.4f}  IoU={:.4f}  F1={:.4f}  MAE={:.4f}  Contour_mIoU={:.4f}  (n={})'.format(
-                epoch, agg['loss'] / n, agg['iou'] / n, agg['f1'] / n, agg['mae'] / n, agg['contour_miou'] / n, n))
+            self.exp_logger.add_scalar('Val/Contour_mIoU', contour_miou, epoch, axis='epoch')
             if first_batch_tb is not None:
                 img, pred, gt = first_batch_tb
                 n_show = min(4, img.shape[0])
@@ -548,6 +570,7 @@ class Trainer:
 
         if was_training:
             model.train()
+        return contour_miou    # higher = better; used for early stopping in main()
 
     def _train_batch(self, batch):
         if args.use_accelerate:
@@ -669,16 +692,37 @@ def main():
         model_opt_lrsch=init_models_optimizers(args.epochs, to_be_distributed)
     )
 
+    def _state_dict():
+        if args.use_accelerate:
+            return trainer.model.state_dict()
+        return trainer.model.module.state_dict() if to_be_distributed else trainer.model.state_dict()
+
+    best_miou = float('-inf')
+    best_epoch = None
+    epochs_since_improve = 0
     for epoch in range(epoch_st, args.epochs+1):
         train_loss = trainer.train_epoch(epoch)
-        trainer.validate(epoch)
+        val_miou = trainer.validate(epoch)
         # Save checkpoint
         if epoch >= args.epochs - config.save_last and epoch % config.save_step == 0:
-            if args.use_accelerate:
-                state_dict = trainer.model.state_dict()
+            torch.save(_state_dict(), os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
+
+        # Early stopping on Val/Contour_mIoU (higher = better). Only on the main process, and only
+        # on epochs where validation actually ran (val_miou is None otherwise). Always keep best.pth.
+        if val_miou is not None and trainer._is_main_process():
+            if val_miou > best_miou + args.early_stop_min_delta:
+                best_miou, best_epoch, epochs_since_improve = val_miou, epoch, 0
+                torch.save(_state_dict(), os.path.join(args.ckpt_dir, 'best.pth'))
+                logger.info('New best Val/Contour_mIoU={:.4f} @ epoch {} -> saved best.pth'.format(best_miou, epoch))
             else:
-                state_dict = trainer.model.module.state_dict() if to_be_distributed else trainer.model.state_dict()
-            torch.save(state_dict, os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
+                epochs_since_improve += 1
+                if args.early_stop_patience and epochs_since_improve >= args.early_stop_patience:
+                    logger.info('Early stopping at epoch {}: Val/Contour_mIoU has not improved for {} '
+                                'validations (best={:.4f} @ epoch {}).'.format(
+                                    epoch, epochs_since_improve, best_miou, best_epoch))
+                    break
+    if best_epoch is not None:
+        logger.info('Training done. Best Val/Contour_mIoU={:.4f} @ epoch {} (best.pth).'.format(best_miou, best_epoch))
     if trainer.exp_logger is not None:
         trainer.exp_logger.close()
     if to_be_distributed:

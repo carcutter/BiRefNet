@@ -394,6 +394,48 @@ Download backbone weights from [my google-drive folder](https://drive.google.com
 
 
 
+## Data augmentation (interior fork)
+
+Augmentations are applied **only to the training split** (`is_train=True`) and are driven by
+`Config.preproc_methods` (`config.py`) via `image_proc.py:preproc`. With the current settings
+(`background_color_synthesis=False`) the active methods are
+`['flip', 'enhance', 'rotate', 'blur', 'crop']`, applied per-sample in this order.
+
+### Coarse full-frame model (`train.py` → `dataset.py:MyData`)
+
+| # | Augmentation | Type | Probability | Range / parameters | Applied to |
+|---|---|---|---|---|---|
+| 1 | Horizontal flip | geometric | 0.5 | left↔right mirror | image + GT mask (+ window-blob weight map) |
+| 2 | Rotation | geometric | 0.2 | angle ∈ [−15°, +15°], bicubic | image + GT mask (+ weight map, nearest) |
+| 3 | Random-zoom crop | geometric | 0.2 | random-position window ∈ [0.5, 1.0]× each side (crops away ≤50%), then resized back to `config.size` | image + GT mask (+ weight map, nearest) |
+| 4 | Color enhance | photometric | 1.0 (always, when active) | brightness ×[0.5, 1.5], contrast ×[0.5, 1.5], saturation ×[0.0, 2.0], sharpness ×[0.0, 3.0] | image only |
+| 5 | Gaussian blur | photometric | 0.15 | radius ∈ [0.1, 0.5] px (low intensity) | image only |
+
+- **Geometric** augs (flip, rotate) transform the image and the GT mask **jointly** so they stay
+  aligned; when `--window_blob_loss` is on, the loss-weight map rides the same transforms.
+- **Photometric** augs (enhance, blur) touch the **image only**, never the mask.
+
+**Input preprocessing** (always applied, not augmentation): resize to `config.size` (`cv2.resize`,
+`(W, H)`), `ToTensor`, then ImageNet normalization — mean `[0.485, 0.456, 0.406]`,
+std `[0.229, 0.224, 0.225]`.
+
+**Disabled by default** (present in the code, off in the current config):
+- **Multi-scale / dynamic resize** — `dynamic_size=None` (fixed `config.size`); enabling it randomizes
+  the per-batch resolution but can break `torch.compile`.
+- **Background-color synthesis** — `background_color_synthesis=False`; when enabled it replaces the
+  background with random/hard-negative colors and reduces the augmentations to horizontal-flip only.
+
+### Standalone crop refiner (`train_refiner.py` → `dataset_refiner.py:RefinerData`)
+
+The UNet mask-refiner uses a **separate** pipeline on 512×512 crops: horizontal flip (0.5),
+rotation ±15° (0.2), and light color jitter (brightness/contrast/saturation ∈ [0.8, 1.2], p=0.5),
+**plus** a mask-degradation pipeline applied to the *input* (conditioning) mask only — morphology
+(erode/dilate), downsample→upsample blur, affine jitter, and optional spurious far-from-object
+blobs. Additive Gaussian noise is available but **disabled** in the shipped configs
+(`degrade_noise_prob: 0.0`) so it doesn't speckle the solid interior. See `dataset_refiner.py`
+(`degrade_mask`, `DEFAULT_DEGRADE_CFG`) for the full knob list.
+
+
 ## Well-trained weights:
 
 Download the `BiRefNet-{TASK}-{EPOCH}.pth` from [[**stuff**](https://drive.google.com/drive/folders/1s2Xe0cjq-2ctnJBR24563yMSCOu4CcxM)] and [the release page](https://github.com/ZhengPeng7/BiRefNet/releases) of this repo. Info of the corresponding (predicted\_maps/performance/training\_log) weights can be also found in folders like `exp-BiRefNet-{TASK_SETTINGS}` in the same directory.
