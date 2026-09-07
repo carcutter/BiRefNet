@@ -1,0 +1,50 @@
+# Coarse BiRefNet (Swin-L) — FULL fine-tune from the public DIS checkpoint on the data/train index.
+# Fresh full FT (encoder + decoder), 90/10 rng split + early stopping. Uses the current augmentation
+# set (incl. the new half-size crop p=0.3 and letterbox p=0.3, active via config.preproc_methods).
+#
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Training loop ----
+# epoch_st parsed from resume filename (epoch_590) => starts 591; 690 = 100 fine-tuning epochs.
+epochs: 690
+batch_size: 2                 # Swin-L @1024; bs=1 breaks BatchNorm.
+ckpt_dir: runs/coarse-swin-l-data-train
+resume: weights/BiRefNet-DIS-epoch_590.pth     # public DIS-pretrained Swin-L checkpoint
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Full fine-tune (encoder trained) ----
+freeze_bb: false
+
+# ---- Checkpointing ----
+save_step: 10
+save_last: 100
+
+# ---- Early stopping ----
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split ----
+# In-CSV paths are relative to the index's own dir (data_link/train), which MyData tries as a
+# resolution root; missing image/mask pairs are dropped automatically (robust to a mid-update index).
+csv_index: /home/renato/projects/interior-segmentation/BiRefNet/data_link/train/index.csv
+val_split: 0.1                # 90/10 split
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow    # wandb removed. MLflow: local sqlite store under ckpt_dir/mlflow.db unless MLFLOW_TRACKING_URI is set.
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-data-train
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

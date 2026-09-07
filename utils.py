@@ -51,6 +51,37 @@ def path_to_binary_mask_from_colors(path, size=None, fg_colors=((255, 0, 0), (0,
     return Image.fromarray(bin_mask).convert('L')
 
 
+def path_to_binary_mask_auto(path, size=None, fg_colors=((255, 0, 0), (0, 255, 0)),
+                             chroma_tol=20, chroma_frac=0.005):
+    """Adaptive per-mask binarization for datasets that mix two mask conventions:
+      - **Colour-coded mask** (contains coloured, i.e. non-grey, pixels): apply the colour rule —
+        pixels matching any colour in `fg_colors` (red/green) are foreground, everything else bg.
+      - **Black-and-white mask** (only greyscale, no colour): apply luminance — white/bright pixels
+        are foreground.
+
+    A pixel is 'chromatic' when its channel spread max(R,G,B)-min(R,G,B) > `chroma_tol`; the mask is
+    treated as colour-coded when chromatic pixels exceed `chroma_frac` of the image (robust to a few
+    stray/compression pixels). Thresholding is at native resolution before resize.
+    """
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(path)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    spread = rgb.max(axis=-1).astype(np.int16) - rgb.min(axis=-1).astype(np.int16)
+    is_coloured = float((spread > chroma_tol).mean()) > chroma_frac
+    if is_coloured:
+        fg = np.zeros(rgb.shape[:2], dtype=bool)
+        for color in fg_colors:
+            fg |= np.all(rgb == np.array(color, dtype=np.uint8), axis=-1)
+    else:
+        # Pure black/white mask: white (bright) is foreground.
+        fg = rgb.max(axis=-1) > 127
+    bin_mask = (fg.astype(np.uint8) * 255)
+    if size:
+        bin_mask = cv2.resize(bin_mask, size, interpolation=cv2.INTER_LINEAR)
+    return Image.fromarray(bin_mask).convert('L')
+
+
 def path_to_binary_mask_nonbg(path, size=None, bg_colors=((0, 0, 0),)):
     """Load an RGB color-coded segmentation mask and binarize by background subtraction:
     any pixel NOT in `bg_colors` becomes foreground (255). Robust to adding new class

@@ -399,25 +399,42 @@ Download backbone weights from [my google-drive folder](https://drive.google.com
 Augmentations are applied **only to the training split** (`is_train=True`) and are driven by
 `Config.preproc_methods` (`config.py`) via `image_proc.py:preproc`. With the current settings
 (`background_color_synthesis=False`) the active methods are
-`['flip', 'enhance', 'rotate', 'blur', 'crop']`, applied per-sample in this order.
+`['flip', 'enhance', 'rotate', 'blur', 'crop', 'letterbox']`. Regardless of the list order,
+`preproc` applies them per-sample in a fixed order: **flip → crop → rotate → letterbox → enhance → blur**.
 
 ### Coarse full-frame model (`train.py` → `dataset.py:MyData`)
 
 | # | Augmentation | Type | Probability | Range / parameters | Applied to |
 |---|---|---|---|---|---|
 | 1 | Horizontal flip | geometric | 0.5 | left↔right mirror | image + GT mask (+ window-blob weight map) |
-| 2 | Rotation | geometric | 0.2 | angle ∈ [−15°, +15°], bicubic | image + GT mask (+ weight map, nearest) |
-| 3 | Random-zoom crop | geometric | 0.2 | random-position window ∈ [0.5, 1.0]× each side (crops away ≤50%), then resized back to `config.size` | image + GT mask (+ weight map, nearest) |
-| 4 | Color enhance | photometric | 1.0 (always, when active) | brightness ×[0.5, 1.5], contrast ×[0.5, 1.5], saturation ×[0.0, 2.0], sharpness ×[0.0, 3.0] | image only |
-| 5 | Gaussian blur | photometric | 0.15 | radius ∈ [0.1, 0.5] px (low intensity) | image only |
+| 2 | Half-size crop | geometric | 0.3 | random-position window of 0.5× each side (¼ area / 2× zoom), then resized back to `config.size` | image + GT mask (+ weight map, nearest) |
+| 3 | Rotation | geometric | 0.2 | angle ∈ [−15°, +15°], bicubic | image + GT mask (+ weight map, nearest) |
+| 4 | Letterbox | geometric | 0.3 | shrink content vertically, add top/bottom bars (total ≤30% of H, random split); **white** bars on image, **black** on mask/weight; full width kept, output size unchanged | image + GT mask (+ weight map, nearest) |
+| 5 | Color enhance | photometric | 1.0 (always, when active) | brightness ×[0.5, 1.5], contrast ×[0.5, 1.5], saturation ×[0.0, 2.0], sharpness ×[0.0, 3.0] | image only |
+| 6 | Gaussian blur | photometric | 0.15 | radius ∈ [0.1, 0.5] px (low intensity) | image only |
 
-- **Geometric** augs (flip, rotate) transform the image and the GT mask **jointly** so they stay
-  aligned; when `--window_blob_loss` is on, the loss-weight map rides the same transforms.
+- **Geometric** augs (flip, crop, rotate, letterbox) transform the image and the GT mask **jointly**
+  so they stay aligned; when `--window_blob_loss` is on, the loss-weight map rides the same transforms.
+  Letterbox pads the image with **white** bars but the mask/weight with **black** (background).
 - **Photometric** augs (enhance, blur) touch the **image only**, never the mask.
 
 **Input preprocessing** (always applied, not augmentation): resize to `config.size` (`cv2.resize`,
 `(W, H)`), `ToTensor`, then ImageNet normalization — mean `[0.485, 0.456, 0.406]`,
 std `[0.229, 0.224, 0.225]`.
+
+**Mask binarization** (`config.mask_color_to_binary`, `utils.py`). GT masks come in two conventions
+across our datasets, so the default is **`'auto'`** (per-mask), which picks the rule from the mask's
+own content:
+- If the mask contains **any coloured (non-grey) pixels** → it's a colour-coded mask: **red + green
+  are foreground** (`mask_fg_colors`), everything else (blue windows, black) is background.
+- If the mask is **only black and white** (greyscale, no colour) → **white is foreground**.
+
+A pixel counts as coloured when `max(R,G,B) − min(R,G,B) > 20`; the mask is treated as colour-coded
+when such pixels exceed 0.5% of the image (robust to stray/compression pixels). This lets a single
+run mix colour-coded interior masks (e.g. `gold_dataset/*`) with black-and-white detail masks (e.g.
+`old_dataset_details`, `details/rims`) correctly. The older fixed modes remain available:
+`'colors'` (always red/green), `'nonbg'` (anything not in `mask_bg_colors`), `'none'` (grayscale
+luminance).
 
 **Disabled by default** (present in the code, off in the current config):
 - **Multi-scale / dynamic resize** — `dynamic_size=None` (fixed `config.size`); enabling it randomizes

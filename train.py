@@ -5,6 +5,15 @@ import shutil
 import datetime
 from contextlib import nullcontext
 import argparse
+
+# Cap intra-op thread pools BEFORE numpy/torch/cv2 load. With N dataloader workers each worker
+# otherwise spins up its own OpenBLAS/OMP/MKL thread pool (~#cores threads each), so N workers ×
+# cores threads oversubscribe the CPUs and thrash — starving the GPU on data-heavy pipelines
+# (decode + resize + augment per 1024px sample). One thread per lib lets the workers run in
+# genuine parallel. setdefault ⇒ an explicit env override still wins.
+for _thr_var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+    os.environ.setdefault(_thr_var, '1')
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,6 +57,9 @@ from utils import Logger, AverageMeter, set_seed, check_state_dict, save_tensor_
 
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+import cv2
+cv2.setNumThreads(0)   # OpenCV threads off in the main proc; forked workers inherit this (see _worker_init).
 from torch.distributed import init_process_group, destroy_process_group
 from torchvision.utils import make_grid
 
@@ -113,6 +125,16 @@ def build_parser():
     p.add_argument('--num_workers', default=8, type=int,
                    help='DataLoader worker processes for the train/val loaders (capped at os.cpu_count()). '
                         'Overrides the batch-size-derived default. Smoke runs force 0.')
+    p.add_argument('--prefetch_factor', default=4, type=int,
+                   help='Batches each worker buffers ahead (DataLoader default is 2). Higher hides '
+                        'per-sample decode/augment latency so the GPU is not left waiting. Ignored when '
+                        'num_workers=0.')
+    p.add_argument('--freeze_bb', default=False, type=lambda x: str(x).lower() == 'true',
+                   help='Freeze the Swin/PVT encoder and train ONLY the decoder. Sets '
+                        'requires_grad=False on all bb.* params (except refiner) before the optimizer '
+                        'is built, so a shared encoder stays fixed across decoder-only fine-tunes. '
+                        '(DINOv3 backbones already freeze via config.freeze_bb; Swin uses LayerNorm so '
+                        'there are no encoder running-stats to worry about.)')
     p.add_argument('--early_stop_patience', default=0, type=int,
                    help='Early stop if Val/Contour_mIoU does not improve for this many consecutive '
                         'validations (0 = disabled). Requires validation to be enabled. The best '
@@ -246,22 +268,36 @@ print('batch size:', config.batch_size)
 
 from dataset import custom_collate_fn
 
+def _worker_init(worker_id):
+    # Belt-and-suspenders alongside the env caps set at import: force single-threaded OpenCV inside
+    # each forked worker so N workers can't collectively oversubscribe the CPUs and starve the GPU.
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
+
+
 def prepare_dataloader(dataset: torch.utils.data.Dataset, batch_size: int, to_be_distributed=False, is_train=True):
     # Prepare dataloaders. Worker count tracks config.num_workers (capped at CPU cores) — NOT the
     # batch size, which would throttle small-batch / big-model runs (e.g. Swin-L @1024, bs=2) and
     # starve the GPU. persistent_workers keeps the pool alive across epochs when workers > 0.
     nw = min(config.num_workers, os.cpu_count() or config.num_workers)
+    loader_kwargs = dict(
+        dataset=dataset, batch_size=batch_size, num_workers=nw, pin_memory=True,
+        drop_last=True, persistent_workers=nw > 0, worker_init_fn=_worker_init if nw > 0 else None,
+        collate_fn=custom_collate_fn if is_train and config.dynamic_size else None,
+    )
+    if nw > 0:
+        # Buffer more batches ahead per worker (default 2). Higher prefetch hides per-sample decode/
+        # augment latency so the GPU finds a batch ready when it finishes a step. Only valid when nw>0.
+        loader_kwargs['prefetch_factor'] = args.prefetch_factor
     if to_be_distributed:
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, num_workers=nw, pin_memory=True,
-            shuffle=False, sampler=DistributedSampler(dataset), drop_last=True, persistent_workers=nw > 0,
-            collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
+            shuffle=False, sampler=DistributedSampler(dataset), **loader_kwargs
         )
     else:
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, num_workers=nw, pin_memory=True,
-            shuffle=is_train, sampler=None, drop_last=True, persistent_workers=nw > 0,
-            collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
+            shuffle=is_train, sampler=None, **loader_kwargs
         )
 
 
@@ -371,6 +407,20 @@ def init_models_optimizers(epochs, to_be_distributed):
                 epoch_st = int(args.resume.rstrip('.pth').split('epoch_')[-1]) + 1
         else:
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
+    # Optionally freeze the encoder (decoder-only fine-tune). Must run BEFORE torch.compile / DDP
+    # (which rename params with _orig_mod./module. prefixes) and BEFORE the optimizer is built
+    # (train.py:417 selects requires_grad params). The model's own config.freeze_bb only auto-fires
+    # for DINOv3; this makes the freeze explicit for Swin/PVT. Same key filter as models/birefnet.py.
+    if args.freeze_bb:
+        n_frozen = n_train = 0
+        for name, p in model.named_parameters():
+            if 'bb.' in name and 'refiner.' not in name:
+                p.requires_grad = False
+                n_frozen += p.numel()
+            elif p.requires_grad:
+                n_train += p.numel()
+        logger.info('freeze_bb=True: froze encoder ({:.1f}M params); trainable decoder = {:.1f}M'.format(
+            n_frozen / 1e6, n_train / 1e6))
     if not args.use_accelerate:
         if to_be_distributed:
             model = model.to(device)

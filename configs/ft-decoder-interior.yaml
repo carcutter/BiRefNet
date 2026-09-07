@@ -1,0 +1,47 @@
+# Decoder-only fine-tune (interior bucket) — Swin-L encoder FROZEN and shared across all three ft-decoder
+# runs; only the decoder trains. Shared encoder + decoder init = the best coarse model
+# (from-dis-noblob epoch 690, Val/Contour_mIoU=0.8287). Same strategy as prior runs.
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Encoder freeze (decoder-only) ----
+freeze_bb: true
+
+# ---- Training loop ----
+# epoch_st parsed from resume filename (epoch_690) => starts 691; 730 = 40 decoder-only epochs.
+epochs: 730
+batch_size: 2                 # bs > 1 required for decoder BatchNorm
+ckpt_dir: runs/ft-decoder/interior
+resume: runs/coarse-swin-l-from-dis-noblob/epoch_690.pth
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing ----
+save_step: 10
+save_last: 40
+
+# ---- Early stopping ----
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split ----
+csv_index: ft_decoder_interior.csv
+val_split: 0.2
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: both
+wandb_project: birefnet-interior
+wandb_run_name: ft-decoder-interior
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

@@ -115,6 +115,8 @@ def preproc(image, label, preproc_methods=['flip'], weight=None):
         image, label, weight = random_crop(image, label, weight)
     if 'rotate' in preproc_methods:
         image, label, weight = random_rotate(image, label, weight)
+    if 'letterbox' in preproc_methods:
+        image, label, weight = random_letterbox(image, label, weight)
     if 'enhance' in preproc_methods:
         image = color_enhance(image)
     if 'blur' in preproc_methods:
@@ -133,11 +135,11 @@ def cv_random_flip(img, label, weight=None):
     return img, label, weight
 
 
-def random_crop(image, label, weight=None, prob=0.2, min_scale=0.5):
-    """Random-zoom crop. With probability `prob`, take a random-position window whose size is a
-    random fraction in [`min_scale`, 1.0] of each side (i.e. crop away up to 1-min_scale of the
-    frame), then resize the window back to the original size. Resizing back is required: the batch
-    is fixed-resolution (config.size), so a raw crop of varying size would break collation.
+def random_crop(image, label, weight=None, prob=0.3, crop_frac=0.5):
+    """Fixed half-size zoom crop. With probability `prob`, take a random-position window whose size
+    is `crop_frac` of each side (default 0.5 ⇒ half width and half height, i.e. a quarter of the
+    area / a 2× zoom), then resize it back to the original size. Resizing back is required: the
+    batch is fixed-resolution (config.size), so a raw crop of a different size would break collation.
 
     Geometric — image, label and (optional) weight map are cropped from the same box and resized
     together. Image uses bilinear; label/weight use nearest to keep the mask crisp.
@@ -145,8 +147,8 @@ def random_crop(image, label, weight=None, prob=0.2, min_scale=0.5):
     if random.random() >= prob:
         return image, label, weight
     W, H = image.size
-    cw = random.randint(int(round(min_scale * W)), W)
-    ch = random.randint(int(round(min_scale * H)), H)
+    cw = max(1, int(round(crop_frac * W)))
+    ch = max(1, int(round(crop_frac * H)))
     x0 = random.randint(0, W - cw)
     y0 = random.randint(0, H - ch)
     box = (x0, y0, x0 + cw, y0 + ch)
@@ -154,6 +156,39 @@ def random_crop(image, label, weight=None, prob=0.2, min_scale=0.5):
     label = label.crop(box).resize((W, H), Image.NEAREST)
     if weight is not None:
         weight = weight.crop(box).resize((W, H), Image.NEAREST)
+    return image, label, weight
+
+
+def random_letterbox(image, label, weight=None, prob=0.3, max_frac=0.3):
+    """Letterbox pad (top/bottom only). With probability `prob`, shrink the content vertically and
+    add horizontal bars so the frame keeps its original size — WHITE bars on the image, BLACK bars
+    on the mask (and 0 on the weight map). Simulates letterboxed / matted footage where the subject
+    sits in a central horizontal band. Only top/bottom borders are added; full width is preserved.
+
+    The total border height is a random fraction (up to `max_frac`) of H, split randomly between top
+    and bottom (so the band may be centred or offset). Content is resized into the remaining height,
+    then pasted onto the padded canvas. Geometric: image (bilinear) + label/weight (nearest) stay
+    aligned. Output size is unchanged so fixed-resolution batch collation is preserved.
+    """
+    if random.random() >= prob:
+        return image, label, weight
+    W, H = image.size
+    total = min(int(round(random.uniform(0.05, max_frac) * H)), H - 1)   # top+bottom border height
+    if total <= 0:
+        return image, label, weight
+    content_h = H - total
+    top = random.randint(0, total)                                       # random split ⇒ centred or offset
+    white = (255,) * len(image.getbands())
+
+    out_img = Image.new(image.mode, (W, H), white)
+    out_img.paste(image.resize((W, content_h), Image.BILINEAR), (0, top))
+    out_lab = Image.new(label.mode, (W, H), 0)                           # black = background
+    out_lab.paste(label.resize((W, content_h), Image.NEAREST), (0, top))
+    image, label = out_img, out_lab
+    if weight is not None:
+        out_w = Image.new(weight.mode, (W, H), 0)                        # no upweighting in the bars
+        out_w.paste(weight.resize((W, content_h), Image.NEAREST), (0, top))
+        weight = out_w
     return image, label, weight
 
 

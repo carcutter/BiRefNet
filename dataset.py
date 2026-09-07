@@ -10,7 +10,7 @@ from torchvision import transforms
 
 from image_proc import preproc
 from config import Config
-from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg, path_to_window_blob_map
+from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg, path_to_binary_mask_auto, path_to_window_blob_map
 
 
 Image.MAX_IMAGE_PIXELS = None       # remove DecompressionBombWarning
@@ -177,6 +177,9 @@ class MyData(data.Dataset):
             mode = 'none'
         if mode == 'nonbg':
             return path_to_binary_mask_nonbg(path, size=self.data_size, bg_colors=config.mask_bg_colors)
+        if mode == 'auto':
+            # Per-mask: coloured masks ⇒ red/green rule; pure black&white masks ⇒ white=fg.
+            return path_to_binary_mask_auto(path, size=self.data_size, fg_colors=config.mask_fg_colors)
         if mode == 'colors':
             return path_to_binary_mask_from_colors(path, size=self.data_size, fg_colors=config.mask_fg_colors)
         return path_to_image(path, size=self.data_size, color_type='gray')
