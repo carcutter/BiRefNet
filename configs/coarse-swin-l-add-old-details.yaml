@@ -5,11 +5,12 @@
 # Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
 
 # ---- Training loop ----
-# epoch_st parsed from resume filename (epoch_590) => starts 591; 690 = 100 fine-tuning epochs.
+# Renamed from coarse-swin-l-data-train (see runs/). Resumes the in-progress run from its epoch_600
+# checkpoint: epoch_st parsed from the filename => starts 601; 690 = target (100 epochs from DIS ep590).
 epochs: 690
 batch_size: 2                 # Swin-L @1024; bs=1 breaks BatchNorm.
-ckpt_dir: runs/coarse-swin-l-data-train
-resume: weights/BiRefNet-DIS-epoch_590.pth     # public DIS-pretrained Swin-L checkpoint
+ckpt_dir: runs/coarse-swin-l-add-old-details
+resume: runs/coarse-swin-l-add-old-details/epoch_600.pth   # continue the renamed run (weights preserved)
 dist: false
 use_accelerate: false
 smoke_test: 0
@@ -28,6 +29,7 @@ early_stop_min_delta: 0.0
 # ---- Model ----
 bb: swin_v1_l
 input_size: 1024
+mixed_precision: fp16         # AMP fp16 training (matches fp16 deployment); manual path autocasts + GradScaler
 
 # ---- Loss ----
 window_blob_loss: false
@@ -43,7 +45,7 @@ num_workers: 8
 # ---- Experiment logging ----
 logger: tensorboard,mlflow    # wandb removed. MLflow: local sqlite store under ckpt_dir/mlflow.db unless MLFLOW_TRACKING_URI is set.
 wandb_project: birefnet-interior
-wandb_run_name: coarse-swin-l-data-train
+wandb_run_name: coarse-swin-l-add-old-details   # MLflow/TB run name
 wandb_entity: meero_rd
 
 # ---- Metrics ----

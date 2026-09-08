@@ -159,6 +159,10 @@ def build_parser():
     p.add_argument('--window_blob_loss_weight', default=5.0, type=float,
                    help='Multiplier k for the window-blob weighted BCE: flagged pixels count k× '
                         '(weight = 1 + (k-1)*map). Only used when --window_blob_loss is set.')
+    p.add_argument('--mixed_precision', default=None, choices=['no', 'fp16', 'bf16', 'fp8'],
+                   help='Override config.mixed_precision. In the manual (non-accelerate) path this '
+                        'enables AMP autocast for the training forward (+ GradScaler for fp16); '
+                        'validation already autocasts at this precision.')
     return p
 
 
@@ -197,6 +201,9 @@ if args.batch_size is not None:
     config.batch_size = args.batch_size
 # Explicit --num_workers wins over the batch-size-derived value above (smoke still forces 0 below).
 config.num_workers = args.num_workers
+# Explicit --mixed_precision (CLI/YAML) overrides the config.py default (applies to both paths).
+if args.mixed_precision is not None:
+    config.mixed_precision = args.mixed_precision
 # Checkpoint cadence overrides (smoke block below still forces save_last=epochs, save_step=1).
 if args.save_step is not None:
     config.save_step = args.save_step
@@ -431,6 +438,12 @@ def init_models_optimizers(epochs, to_be_distributed):
         model = torch.compile(model, mode=['default', 'reduce-overhead', 'max-autotune'][0])
     if config.precisionHigh:
         torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    # cuDNN autotuner: with fixed-size inputs it benchmarks and caches the fastest conv algorithms
+    # (notable speedup for the ASPP/deformable decoder). Only safe when input size is static.
+    if not config.dynamic_size:
+        torch.backends.cudnn.benchmark = True
 
     # Setting optimizer
     if config.optimizer == 'AdamW':
@@ -455,6 +468,15 @@ class Trainer:
         self.train_loader, self.val_loader = data_loaders
         if args.use_accelerate:
             self.train_loader, self.model, self.optimizer = accelerator.prepare(self.train_loader, self.model, self.optimizer)
+        # Manual-path AMP: when not using accelerate, autocast the training forward at
+        # config.mixed_precision. fp16 additionally needs a GradScaler (bf16 has enough range).
+        # (accelerate handles its own autocast/scaler, so this stays inert in that path.)
+        self._amp_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16}.get(config.mixed_precision)
+        self._use_amp = (not args.use_accelerate) and (self._amp_dtype is not None)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=(self._use_amp and self._amp_dtype is torch.float16))
+        if self._use_amp:
+            logger.info('manual-path AMP enabled: dtype={}, grad_scaler={}'.format(
+                config.mixed_precision, self.scaler.is_enabled()))
         if config.out_ref:
             self.criterion_gdt = nn.BCELoss()
 
@@ -629,19 +651,26 @@ class Trainer:
             class_labels = batch[2]#.to(device)
             weight_map = batch[3] if len(batch) > 3 else None   # window-blob loss weight map
         else:
-            inputs = batch[0].to(device)
-            gts = batch[1].to(device)
-            class_labels = batch[2].to(device)
-            weight_map = batch[3].to(device) if len(batch) > 3 else None
-        self.optimizer.zero_grad()
-        scaled_preds, class_preds_lst = self.model(inputs)
+            # non_blocking=True + pinned host memory ⇒ async H2D copy overlaps with compute.
+            inputs = batch[0].to(device, non_blocking=True)
+            gts = batch[1].to(device, non_blocking=True)
+            class_labels = batch[2].to(device, non_blocking=True)
+            weight_map = batch[3].to(device, non_blocking=True) if len(batch) > 3 else None
+        self.optimizer.zero_grad(set_to_none=True)   # None grads: cheaper + slightly faster than zeroing
+        # Autocast the model FORWARD only. BCE / BCELoss (PixLoss + the out_ref gdt loss) are unsafe
+        # under fp16 autocast, so we compute every loss in fp32 below, upcasting the predictions.
+        amp_ctx = torch.amp.autocast(device_type='cuda', dtype=self._amp_dtype) if self._use_amp else nullcontext()
+        with amp_ctx:
+            scaled_preds, class_preds_lst = self.model(inputs)
         if config.out_ref:
             (outs_gdt_pred, outs_gdt_label), scaled_preds = scaled_preds
             for _idx, (_gdt_pred, _gdt_label) in enumerate(zip(outs_gdt_pred, outs_gdt_label)):
-                _gdt_pred = nn.functional.interpolate(_gdt_pred, size=_gdt_label.shape[2:], mode='bilinear', align_corners=True).sigmoid()
-                _gdt_label = _gdt_label.sigmoid()
+                _gdt_pred = nn.functional.interpolate(_gdt_pred.float(), size=_gdt_label.shape[2:], mode='bilinear', align_corners=True).sigmoid()
+                _gdt_label = _gdt_label.float().sigmoid()
                 loss_gdt = self.criterion_gdt(_gdt_pred, _gdt_label) if _idx == 0 else self.criterion_gdt(_gdt_pred, _gdt_label) + loss_gdt
             # self.loss_dict['loss_gdt'] = loss_gdt.item()
+        # Upcast side-map predictions to fp32 for the (BCE-containing) pixel loss.
+        scaled_preds = [p.float() for p in scaled_preds]
         if None in class_preds_lst:
             loss_cls = 0.
         else:
@@ -671,9 +700,16 @@ class Trainer:
         if args.use_accelerate:
             loss = loss / accelerator.gradient_accumulation_steps
             accelerator.backward(loss)
+            self.optimizer.step()
+        elif self.scaler.is_enabled():
+            # fp16 AMP: scale the loss to avoid gradient underflow, then unscale+step+update.
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
         else:
+            # fp32 or bf16 (bf16 autocast needs no scaler).
             loss.backward()
-        self.optimizer.step()
+            self.optimizer.step()
 
     def train_epoch(self, epoch):
         global logger_loss_idx
