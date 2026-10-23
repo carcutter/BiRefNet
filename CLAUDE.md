@@ -6,6 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BiRefNet — official implementation of "Bilateral Reference for High-Resolution Dichotomous Image Segmentation" (CAAI AIR 2024). Despite the name, it is used as a general binary image segmentation framework: DIS, camouflaged-object detection (COD), high-res salient-object detection (HRSOD), background removal, and matting.
 
+## Model registry (MODELS.md) — keep updated
+
+`MODELS.md` is the per-model registry: for every trained model version it records **data,
+architecture, losses, and augmentations** (plus base checkpoint, split, precision, schedule, result,
+and export). **Whenever you train a new model — or retrain/continue an existing one — add or update
+its entry in `MODELS.md` in the same turn, before/at export time.** Record what differs from the
+"Shared defaults" section; keep the "Augmentation timeline" accurate (which runs saw letterbox /
+half-crop). Do not let an export land without its MODELS.md entry.
+
 ## Environment
 
 Managed with [uv](https://docs.astral.sh/uv/). Dependencies live in `pyproject.toml` (mirrors `requirements.txt`, kept around for the shell scripts).
