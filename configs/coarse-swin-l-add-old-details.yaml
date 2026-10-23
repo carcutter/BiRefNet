@@ -10,7 +10,7 @@
 epochs: 690
 batch_size: 2                 # Swin-L @1024; bs=1 breaks BatchNorm.
 ckpt_dir: runs/coarse-swin-l-add-old-details
-resume: runs/coarse-swin-l-add-old-details/epoch_600.pth   # continue the renamed run (weights preserved)
+resume: runs/coarse-swin-l-add-old-details/epoch_641.pth   # resume after external kill at ep642 (= best.pth, ep641)
 dist: false
 use_accelerate: false
 smoke_test: 0

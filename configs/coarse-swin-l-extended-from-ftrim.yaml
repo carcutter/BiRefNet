@@ -1,0 +1,50 @@
+# Coarse BiRefNet (Swin-L) — FULL fine-tune on the extended data/train index, initialized from the
+# ft-rim weights (coarse-swin-l-window-blob-ft-rim, epoch 685) instead of the public DIS checkpoint.
+# Counterpart of coarse-swin-l-add-old-details.yaml (same data/aug/opt/precision) for the
+# extended-dataset-vs-ftrim comparison — only the starting weights differ.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Training loop ----
+# epoch_st parsed from resume filename (epoch_685) => starts 686; 785 = 100 fine-tuning epochs.
+epochs: 785
+batch_size: 2
+ckpt_dir: runs/coarse-swin-l-extended-from-ftrim
+resume: runs/coarse-swin-l-window-blob/epoch_685.pth   # ft-rim weights (coarse-swin-l-window-blob-ft-rim)
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Full fine-tune (encoder trained) ----
+freeze_bb: false
+
+# ---- Checkpointing ----
+save_step: 10
+save_last: 100
+
+# ---- Early stopping ----
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+mixed_precision: fp16
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split ----
+csv_index: /home/renato/projects/interior-segmentation/BiRefNet/data_link/train/index.csv
+val_split: 0.1
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-extended-from-ftrim
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

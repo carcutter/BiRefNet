@@ -162,3 +162,5 @@ tools/viewer/manifest.json
 
 # Machine-specific dataset symlink (points to a local absolute path)
 data_link
+# Stray scratch checkpoints
+temp/

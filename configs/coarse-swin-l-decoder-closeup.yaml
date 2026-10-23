@@ -1,0 +1,51 @@
+# Specialized DECODER for interior/exterior CLOSE-UP shots. Shared Swin-L encoder is FROZEN
+# (freeze_bb=true) and initialized from the ft-rim weights (coarse-swin-l-window-blob-ft-rim,
+# epoch 685); only the decoder is trained, on the close-up buckets only. Pairs with the existing
+# general-interior decoder on the same shared encoder at deploy time.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Encoder freeze (decoder-only) ----
+freeze_bb: true                # train the decoder only; the shared encoder stays fixed
+
+# ---- Training loop ----
+# epoch_st parsed from resume filename (epoch_685) => starts 686; 735 = 50 decoder-only epochs.
+epochs: 735
+batch_size: 2                  # decoder BatchNorm needs bs>1; encoder still runs forward so memory ~ full FT
+ckpt_dir: runs/coarse-swin-l-decoder-closeup
+resume: runs/coarse-swin-l-window-blob/epoch_685.pth   # ft-rim shared-encoder + decoder init
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing ----
+save_step: 10
+save_last: 50
+
+# ---- Early stopping ----
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+mixed_precision: fp16
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split ----
+# Close-up buckets only: data_link/train/details/* + old_dataset_details (6,192 pairs).
+csv_index: /home/renato/projects/interior-segmentation/BiRefNet/data/interior_segmentation/details_closeup.csv
+val_split: 0.1
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-decoder-closeup
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

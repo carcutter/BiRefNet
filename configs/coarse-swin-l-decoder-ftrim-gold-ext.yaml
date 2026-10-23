@@ -1,0 +1,60 @@
+# Decoder-only fine-tune of the FT-RIM model (encoder FROZEN, shared Swin-L), 50 epochs.
+# "ft-rim" == runs/coarse-swin-l-window-blob/epoch_685.pth (confirmed via the ft-rim ONNX sidecar,
+# which records that checkpoint as its source). epoch_st parsed from epoch_685 => 686; 735 = +50.
+#
+# Data: interior GOLD dataset (all 8 gold_dataset subdirs, 14,890 pairs) + 30% of
+# details/exterior_originals train (337 rows, seed 42) — combined in ftrim_gold_plus_exterior.csv.
+#   * exterior rows carry `wheel_boxes`, so MyData runtime-crops them at load: 50% centred on a
+#     random wheel, 50% random; crop size = 40-70% of image AREA (crop_frac_area=true).
+#   * gold rows have no wheel_boxes => never runtime-cropped.
+# Augmentations: flip, enhance, rotate, blur, and the FOREGROUND letterbox (letterbox_fg=true):
+#   random top/bottom OR left/right bars, black OR white, GT = foreground on the bars. The default
+#   half-size 'crop' aug is intentionally dropped (exterior uses the wheel crop; gold stays uncropped).
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Encoder freeze (decoder-only) ----
+freeze_bb: true
+
+# ---- Training loop ----
+epochs: 735                    # 686..735 = 50 decoder-only epochs
+batch_size: 8                  # decoder-only fp16 @1024 (probe: recommended 8)
+ckpt_dir: runs/coarse-swin-l-decoder-ftrim-gold-ext
+resume: runs/coarse-swin-l-window-blob/epoch_685.pth   # == the ft-rim model
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing / early stop ----
+save_step: 10
+save_last: 100
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+mixed_precision: fp16
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Augmentations ----
+preproc_methods: flip,enhance,rotate,blur,letterbox   # no half-size 'crop' (see header)
+letterbox_fg: true             # foreground bars: random tb/lr, black or white
+letterbox_prob: 0.5            # fires on ~50% of training samples
+crop_frac_area: true           # runtime wheel/random crop size = 40-70% of image AREA
+
+# ---- Dataset / split ----
+csv_index: ftrim_gold_plus_exterior.csv
+val_split: 0.1
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-decoder-ftrim-gold-ext
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4
