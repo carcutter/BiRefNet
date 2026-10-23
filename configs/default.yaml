@@ -1,0 +1,26 @@
+# Default training config for BiRefNet interior-segmentation fine-tuning.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags
+# Unknown keys here fail loudly — argparse `dest` names must match 1:1.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- Training loop ----
+epochs: 50
+ckpt_dir: runs/default
+resume: weights/BiRefNet-DIS-bb_swin_v1_base-epoch_595.pth
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Dataset / split (must match between training and tools/report.py) ----
+csv_index: index.csv
+val_split: 0.2
+csv_split_seed: 42
+
+# ---- Experiment logging ----
+logger: both                 # one of: tensorboard | wandb | both | none
+wandb_project: birefnet-interior
+wandb_run_name: null         # null ⇒ basename(ckpt_dir)
+
+# ---- Metrics ----
+contour_radius: 2            # boundary-IoU ring half-width in pixels

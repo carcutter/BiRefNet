@@ -1,0 +1,50 @@
+# Repeat of coarse-swin-l-decoder-closeup on the NEW data layout.
+# Decoder-only (freeze_bb=true), initialized from the ft-rim weights (coarse-swin-l-window-blob-ft-rim,
+# epoch_685). Same recipe as the original, but the training CSV is rebuilt from the new manifest:
+# ALL details + 20% (seed 42, stratified per dataset) of the gold_dataset interior data
+# (details_closeup_newdata.csv, 7954 pairs). 90/10 rng val split, same as the original run.
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Decoder-only ----
+freeze_bb: true                # train the decoder only; the shared (ft-rim) encoder stays fixed
+
+# ---- Training loop ----
+# CONTINUE the decoder-closeup-newdata run for 30 more epochs on the UPDATED details data
+# (details/ now includes kw2628_closeups, moved from gold_dataset — CSV rebuilt to 8944 pairs).
+# Resume from this run's own best (epoch_732 = copy of best.pth) => epoch_st 733; 762 = +30 epochs.
+epochs: 762
+batch_size: 8                  # decoder-only max-batch probe (fp16, 1024, freeze_bb): recommended 8 (ceiling 9)
+ckpt_dir: runs/coarse-swin-l-decoder-closeup-newdata
+resume: runs/coarse-swin-l-decoder-closeup-newdata/epoch_732.pth   # continue the trained decoder (was ft-rim epoch_685)
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing / early stop ----
+save_step: 10
+save_last: 100
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+mixed_precision: fp16
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split ----
+csv_index: details_closeup_newdata.csv
+val_split: 0.1
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-decoder-closeup-newdata
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

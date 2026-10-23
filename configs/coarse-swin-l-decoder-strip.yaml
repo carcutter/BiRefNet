@@ -1,0 +1,52 @@
+# Decoder-only fine-tune (360 SQUARE-STRIP bucket) — same recipe as coarse-swin-l-decoder-cubemap,
+# but tiling the equirectangular panorama into 4 overlapping 1:1 strips instead of 6 cube faces.
+# Encoder FROZEN (shared Swin-L); only the decoder trains. Base = coarse-swin-l-window-blob/epoch_685
+# (== the ft-rim model), identical to the cubemap run.
+#
+# Tiling: make_360_tiles.py --method strip --aspect 1.0 --overlap 0.5 on the not_backgrounded 360s.
+#   A 2:1 equirect (W=2H) with square tiles (crop_w=H) and overlap 0.5 => exactly 4 tiles, evenly
+#   spaced at x=0,H/2,H,3H/2 (cyclic wrap at the seam). 178 panos -> 712 tiles. Masks keep source
+#   RGB polarity (auto-binarized at train time). interior_360_notbg_strip/{train,test}.csv.
+#   Split is PANO-LEVEL 80/20 (142 train / 36 test panos) — the SAME panos as the cubemap run, so
+#   the two are directly comparable.
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Encoder freeze (decoder-only) ----
+freeze_bb: true
+
+# ---- Training loop ----
+epochs: 735                    # 686..735 = 50 decoder-only epochs (epoch_st from epoch_685)
+batch_size: 8                  # decoder-only fp16 @1024
+ckpt_dir: runs/coarse-swin-l-decoder-strip
+resume: runs/coarse-swin-l-window-blob/epoch_685.pth   # == the ft-rim model (same base as cubemap)
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing / early stop ----
+save_step: 10
+save_last: 100
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+mixed_precision: fp16
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split (explicit pano-level split, same panos as cubemap) ----
+train_csv: /home/renato/projects/interior-segmentation/interior-segmentation/data/processed/interior_360_notbg_strip/train.csv
+val_csv: /home/renato/projects/interior-segmentation/interior-segmentation/data/processed/interior_360_notbg_strip/test.csv
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-decoder-strip
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

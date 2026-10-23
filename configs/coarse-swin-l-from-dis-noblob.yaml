@@ -1,0 +1,54 @@
+# Coarse BiRefNet (Swin-L) — CONTINUES the from-DIS interior+rims+refinement fine-tune, but with
+# the window-blob loss REMOVED. This drops the per-sample path_to_window_blob_map computation
+# (dataset.py:197) — the heaviest CPU cost in the pipeline — so the GPU is no longer data-starved.
+#
+# Safe to resume with the flag off: window_blob_loss is a loss-side reweighting only; it adds no
+# model parameters, so epoch_650.pth (trained WITH the loss) loads byte-for-byte. With the flag
+# false the dataset returns a 3-tuple ⇒ weight_map=None ⇒ PixLoss falls back to plain BCE.
+#
+# Speed fixes that now apply automatically (train.py, no config needed):
+#   - OMP/OPENBLAS/MKL threads capped to 1 + cv2.setNumThreads(0) per worker (no 8×8 thread thrash)
+#   - prefetch_factor defaults to 4 (was 2)
+#
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Training loop ----
+# epoch_st is parsed from the resume filename (epoch_659) ⇒ starts at 660; 690 = 31 more epochs.
+# epoch_659.pth is a copy of the prior run's best.pth (best Val/Contour_mIoU=0.8224 @ epoch 659).
+epochs: 690
+batch_size: 2                # Swin-L @1024; bs=1 breaks BatchNorm (needs >1 value per channel).
+ckpt_dir: runs/coarse-swin-l-from-dis-noblob
+resume: runs/coarse-swin-l-window-blob-from-dis/epoch_659.pth   # prior run's best (= best.pth @ ep659)
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing ----
+save_step: 10
+save_last: 100
+
+# ---- Early stopping ----
+early_stop_patience: 0        # DISABLED — run straight to epoch 690 regardless of Val/Contour_mIoU
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l                 # must match the resume checkpoint's backbone
+input_size: 1024              # square 1024; each side divisible by 32
+
+# ---- Window-blob loss ----
+window_blob_loss: false       # REMOVED — no weight map computed, plain BCE
+
+# ---- Dataset / split ----
+csv_index: train_interior_rims_refinement.csv
+val_split: 0.2
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: both
+wandb_project: birefnet-interior
+wandb_run_name: null          # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

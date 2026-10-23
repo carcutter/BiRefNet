@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dataset viewer — BiRefNet interior segmentation</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: #111; color: #ddd; }
+  header { position: sticky; top: 0; background: #1a1a1a; border-bottom: 1px solid #333; padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; z-index: 10; }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0 12px 0 0; }
+  header label { display: inline-flex; align-items: center; gap: 6px; color: #aaa; }
+  header select, header input[type=text], header input[type=number] {
+    background: #222; color: #ddd; border: 1px solid #444; padding: 4px 6px; border-radius: 4px; font: inherit;
+  }
+  header .stats { margin-left: auto; color: #888; font-variant-numeric: tabular-nums; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; padding: 14px; }
+  .tile { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px; cursor: pointer; }
+  .tile:hover { border-color: #555; }
+  .tile.warn { border-color: #c95; }
+  .tile-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+  .tile-strip .cell { position: relative; aspect-ratio: 1 / 1; background: #000; overflow: hidden; border-radius: 3px; }
+  .tile-strip .cell img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .tile-strip .cell.label { font-size: 10px; color: #777; text-align: center; padding: 2px 0; }
+  .tile-strip .cell.label::after { content: attr(data-label); }
+  .tile-meta { margin-top: 6px; font-size: 11px; color: #999; display: flex; justify-content: space-between; gap: 6px; }
+  .tile-meta .id { color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { display: inline-block; background: #2a2a2a; color: #999; border-radius: 3px; padding: 1px 5px; font-size: 10px; }
+  .badge.warn { background: #5a3; color: #111; }
+  .badge.empty { background: #c33; color: #fff; }
+  .pager { display: flex; gap: 8px; align-items: center; justify-content: center; padding: 14px; color: #aaa; }
+  .pager button { background: #222; color: #ddd; border: 1px solid #444; padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+  .pager button:disabled { opacity: 0.4; cursor: default; }
+  /* modal */
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,.92); z-index: 100; display: none; flex-direction: column; padding: 24px; }
+  #modal.open { display: flex; }
+  #modal .head { display: flex; gap: 12px; align-items: center; color: #ddd; margin-bottom: 10px; }
+  #modal .head .spacer { flex: 1; }
+  #modal .head button { background: #222; color: #ddd; border: 1px solid #444; padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+  #modal .body { flex: 1; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; min-height: 0; }
+  #modal .body .cell { background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }
+  #modal .body .cell img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #modal .body .cell .lbl { position: absolute; top: 6px; left: 6px; background: rgba(0,0,0,.6); color: #ddd; padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+  #modal table { color: #ccc; font-size: 12px; border-collapse: collapse; }
+  #modal table td { padding: 2px 8px 2px 0; }
+  #modal table td.k { color: #888; }
+  .empty-state { padding: 40px; text-align: center; color: #777; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Dataset viewer</h1>
+  <label>Dataset
+    <select id="dataset"><option value="">(all)</option></select>
+  </label>
+  <label>Search
+    <input id="search" type="text" placeholder="filename substring" size="22">
+  </label>
+  <label>Page size
+    <input id="pageSize" type="number" min="12" max="400" step="12" value="48">
+  </label>
+  <label><input id="onlyEmpty" type="checkbox"> only empty/near-empty masks</label>
+  <span class="stats" id="stats">loading…</span>
+</header>
+
+<div id="grid" class="grid"></div>
+<div id="empty" class="empty-state" hidden>No samples match the current filters.</div>
+<div class="pager">
+  <button id="prev">‹ prev</button>
+  <span id="pageInfo">—</span>
+  <button id="next">next ›</button>
+</div>
+
+<div id="modal">
+  <div class="head">
+    <button id="mPrev">‹ prev</button>
+    <button id="mNext">next ›</button>
+    <strong id="mTitle"></strong>
+    <div class="spacer"></div>
+    <button id="mClose">close ✕</button>
+  </div>
+  <div class="body">
+    <div class="cell"><span class="lbl">image</span><img id="mImage" alt=""></div>
+    <div class="cell"><span class="lbl">mask</span><img id="mMask" alt=""></div>
+    <div class="cell"><span class="lbl">aux</span><img id="mAux" alt=""></div>
+    <div class="cell" style="background:#1a1a1a;align-items:flex-start;justify-content:flex-start;padding:14px;">
+      <table id="mMeta"></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const MANIFEST_URL = 'manifest.json';
+const state = {
+  manifest: null,
+  filtered: [],
+  page: 0,
+  pageSize: 48,
+  modalIdx: -1,
+};
+
+function fmt(n, d) { return n == null ? '—' : Number(n).toFixed(d); }
+function basename(p) { return (p || '').split('/').pop(); }
+
+function applyFilters() {
+  const ds = document.getElementById('dataset').value;
+  const q = document.getElementById('search').value.trim().toLowerCase();
+  const onlyEmpty = document.getElementById('onlyEmpty').checked;
+  const samples = state.manifest?.samples || [];
+  state.filtered = samples.filter(s => {
+    if (ds && s.dataset !== ds) return false;
+    if (q && !((s.image || '') + ' ' + (s.mask || '')).toLowerCase().includes(q)) return false;
+    if (onlyEmpty && !(s.mask_area_frac != null && s.mask_area_frac < 0.005)) return false;
+    return true;
+  });
+  state.page = 0;
+  render();
+}
+
+function render() {
+  const grid = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  grid.innerHTML = '';
+  const start = state.page * state.pageSize;
+  const end = Math.min(start + state.pageSize, state.filtered.length);
+  empty.hidden = state.filtered.length > 0;
+
+  for (let i = start; i < end; i++) {
+    const s = state.filtered[i];
+    const tile = document.createElement('div');
+    tile.className = 'tile' + ((s.mask_area_frac != null && s.mask_area_frac < 0.005) ? ' warn' : '');
+    tile.dataset.idx = i;
+    const overlayUrl = s.image;   // for now, overlay column shows image as a stand-in (no canvas needed)
+    const cells = [
+      `<div class="cell"><img loading="lazy" src="${s.image}" alt=""></div>`,
+      `<div class="cell"><img loading="lazy" src="${s.mask}" alt=""></div>`,
+      s.aux ? `<div class="cell"><img loading="lazy" src="${s.aux}" alt=""></div>` : `<div class="cell"></div>`,
+      `<div class="cell"><img loading="lazy" src="${s.image}" alt="" style="opacity:.6;filter:saturate(1.4) contrast(1.1);"></div>`,
+    ].join('');
+    tile.innerHTML = `
+      <div class="tile-strip">${cells}</div>
+      <div class="tile-meta">
+        <span class="id" title="${s.id}">${basename(s.image)}</span>
+        <span>
+          <span class="badge">${s.dataset || '—'}</span>
+          <span class="badge ${s.mask_area_frac != null && s.mask_area_frac < 0.005 ? 'empty' : ''}">fg ${fmt(s.mask_area_frac * 100, 1)}%</span>
+        </span>
+      </div>`;
+    tile.addEventListener('click', () => openModal(i));
+    grid.appendChild(tile);
+  }
+  const total = state.filtered.length;
+  const pages = Math.max(1, Math.ceil(total / state.pageSize));
+  document.getElementById('pageInfo').textContent = `page ${state.page + 1} / ${pages}  •  ${total} samples`;
+  document.getElementById('stats').textContent = `${total.toLocaleString()} / ${(state.manifest?.samples || []).length.toLocaleString()}`;
+  document.getElementById('prev').disabled = state.page === 0;
+  document.getElementById('next').disabled = state.page >= pages - 1;
+}
+
+function openModal(idx) {
+  const s = state.filtered[idx];
+  if (!s) return;
+  state.modalIdx = idx;
+  document.getElementById('mTitle').textContent = s.id;
+  document.getElementById('mImage').src = s.image;
+  document.getElementById('mMask').src = s.mask;
+  document.getElementById('mAux').src = s.aux || '';
+  const rows = [
+    ['id', s.id],
+    ['dataset', s.dataset || '—'],
+    ['image', s.image],
+    ['mask', s.mask],
+    ['aux', s.aux || '—'],
+    ['image_size', s.image_size ? `${s.image_size[0]} × ${s.image_size[1]}` : '—'],
+    ['mask_area_frac', s.mask_area_frac != null ? fmt(s.mask_area_frac, 4) : '—'],
+  ];
+  document.getElementById('mMeta').innerHTML = rows.map(([k, v]) =>
+    `<tr><td class="k">${k}</td><td>${(''+v).replace(/</g,'&lt;')}</td></tr>`).join('');
+  document.getElementById('modal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('open');
+  state.modalIdx = -1;
+}
+
+function modalStep(d) {
+  if (state.modalIdx < 0) return;
+  const next = state.modalIdx + d;
+  if (next < 0 || next >= state.filtered.length) return;
+  openModal(next);
+}
+
+document.getElementById('dataset').addEventListener('change', applyFilters);
+document.getElementById('search').addEventListener('input', applyFilters);
+document.getElementById('onlyEmpty').addEventListener('change', applyFilters);
+document.getElementById('pageSize').addEventListener('change', e => {
+  state.pageSize = Math.max(12, Number(e.target.value) || 48);
+  state.page = 0; render();
+});
+document.getElementById('prev').addEventListener('click', () => { state.page = Math.max(0, state.page - 1); render(); });
+document.getElementById('next').addEventListener('click', () => { state.page += 1; render(); });
+document.getElementById('mClose').addEventListener('click', closeModal);
+document.getElementById('mPrev').addEventListener('click', () => modalStep(-1));
+document.getElementById('mNext').addEventListener('click', () => modalStep(+1));
+document.addEventListener('keydown', e => {
+  if (!document.getElementById('modal').classList.contains('open')) return;
+  if (e.key === 'Escape') closeModal();
+  else if (e.key === 'ArrowLeft') modalStep(-1);
+  else if (e.key === 'ArrowRight') modalStep(+1);
+});
+
+(async function init() {
+  let manifest;
+  try {
+    manifest = await (await fetch(MANIFEST_URL)).json();
+  } catch (e) {
+    document.getElementById('stats').textContent = 'failed to load manifest.json — run build_viewer_manifest.py';
+    return;
+  }
+  state.manifest = manifest;
+  // populate dataset filter
+  const dsSel = document.getElementById('dataset');
+  const datasets = [...new Set((manifest.samples || []).map(s => s.dataset).filter(Boolean))].sort();
+  for (const d of datasets) {
+    const opt = document.createElement('option');
+    opt.value = d; opt.textContent = d;
+    dsSel.appendChild(opt);
+  }
+  applyFilters();
+})();
+</script>
+</body>
+</html>

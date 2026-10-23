@@ -1,4 +1,5 @@
 import os
+import csv
 import random
 import numpy as np
 import cv2
@@ -9,7 +10,8 @@ from torchvision import transforms
 
 from image_proc import preproc
 from config import Config
-from utils import path_to_image
+from runtime_crop import parse_crop_meta, crop_box_for
+from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg, path_to_binary_mask_auto, path_to_window_blob_map
 
 
 Image.MAX_IMAGE_PIXELS = None       # remove DecompressionBombWarning
@@ -34,12 +36,31 @@ class_labels_TR_sorted = _class_labels_TR_sorted.split(', ')
 
 
 class MyData(data.Dataset):
-    def __init__(self, datasets, data_size, is_train=True):
+    def __init__(self, datasets, data_size, is_train=True, csv_path=None, csv_image_root=None,
+                 max_samples=0, val_split=0.0, csv_split_seed=42, window_blob_loss=False):
         # data_size is None when using dynamic_size or data_size is manually set to None (for inference in the original size).
+        # csv_path: if set, load (image_path, mask_path) pairs from a CSV with those columns.
+        #           Paths inside the CSV resolve against csv_image_root (defaults to the CSV's
+        #           own directory). `datasets` is ignored in this mode.
+        # val_split > 0: treat csv_path as a full index and produce the train (1-val_split)
+        #           or val (val_split) slice. The split is deterministic w.r.t. csv_split_seed
+        #           — calling this constructor twice with the same seed but flipped is_train
+        #           yields disjoint, complementary subsets.
         self.is_train = is_train
         self.data_size = data_size
         self.load_all = config.load_all
         self.device = config.device
+        # Window-blob loss: emit a 0/1 weight map flagging FG blobs isolated inside window regions.
+        # Train-only; detection params come from config (see config.py:window_blob_*). The multiplier
+        # k is applied later in PixLoss (passed from the CLI), not here.
+        self.window_blob_loss = bool(window_blob_loss) and is_train
+        if self.window_blob_loss:
+            if self.load_all:
+                raise SystemExit('window_blob_loss is not supported with config.load_all=True '
+                                 '(weight maps are computed per-__getitem__, not preloaded).')
+            if config.dynamic_size is not None:
+                raise SystemExit('window_blob_loss is not supported with config.dynamic_size '
+                                 '(the weight map is resized in __getitem__, not in custom_collate_fn).')
         valid_extensions = ['.png', '.jpg', '.PNG', '.JPG', '.JPEG']
 
         if self.is_train and config.auxiliary_classification:
@@ -51,24 +72,91 @@ class MyData(data.Dataset):
         self.transform_label = transforms.Compose([
             transforms.ToTensor(),
         ])
-        dataset_root = os.path.join(config.data_root_dir, config.task)
-        # datasets can be a list of different datasets for training on combined sets.
-        self.image_paths = []
-        for dataset in datasets.split('+'):
-            image_root = os.path.join(dataset_root, dataset, 'im')
-            self.image_paths += [os.path.join(image_root, p) for p in os.listdir(image_root) if any(p.endswith(ext) for ext in valid_extensions)]
-        self.label_paths = []
-        for p in self.image_paths:
-            for ext in valid_extensions:
-                ## 'im' and 'gt' may need modifying
-                p_gt = p.replace('/im/', '/gt/')[:-(len(p.split('.')[-1])+1)] + ext
-                file_exists = False
-                if os.path.exists(p_gt):
-                    self.label_paths.append(p_gt)
-                    file_exists = True
-                    break
-            if not file_exists:
-                print('Not exists:', p_gt)
+
+        if csv_path is not None:
+            # Different CSVs use different conventions for relative paths: index.csv stores them
+            # relative to csv_image_root (data_link), while data/processed/*.csv (e.g. blob_crops.csv)
+            # store them relative to the repo root. Try each candidate root and use the first where
+            # the file actually exists, so both layouts load without per-file config.
+            csv_dir = os.path.dirname(os.path.abspath(csv_path))
+            candidate_roots = [r for r in (csv_image_root, os.getcwd(), csv_dir) if r]
+
+            def _resolve(rel):
+                if os.path.isabs(rel):
+                    return rel
+                for root in candidate_roots:
+                    cand = os.path.join(root, rel)
+                    if os.path.exists(cand):
+                        return cand
+                return os.path.join(candidate_roots[0], rel)   # let a clear FileNotFound surface downstream
+
+            # list of (img_abs, msk_abs, crop_meta); crop_meta is None unless the row carries
+            # wheel_boxes / crop_box columns (full originals cropped at load, see runtime_crop.py).
+            pairs = []
+            with open(csv_path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Accept both schemas: image_path/mask_path (index.csv) and image/mask (blob_crops.csv).
+                    img_rel = (row.get('image_path') or row.get('image') or '').strip()
+                    msk_rel = (row.get('mask_path') or row.get('mask') or '').strip()
+                    if not img_rel or not msk_rel:
+                        continue
+                    pairs.append((_resolve(img_rel), _resolve(msk_rel), parse_crop_meta(row)))
+
+            if val_split and 0.0 < val_split < 1.0:
+                # Deterministic 80/20-style split. Same seed + flipped is_train ⇒ disjoint subsets.
+                rng = np.random.default_rng(csv_split_seed)
+                idx = np.arange(len(pairs))
+                rng.shuffle(idx)
+                n_val = int(round(len(pairs) * val_split))
+                val_idx = set(idx[:n_val].tolist())
+                keep = (lambda i: i not in val_idx) if is_train else (lambda i: i in val_idx)
+                pairs = [p for i, p in enumerate(pairs) if keep(i)]
+
+            # Drop pairs whose image or mask is missing on disk (e.g. an un-pulled DVC subset such
+            # as kw2607_boat). Done AFTER the split so the deterministic split membership of the
+            # PRESENT samples is identical regardless of which subsets happen to be on disk —
+            # only the missing entries are removed. Prevents a 5%-of-index missing dataset from
+            # crashing a long run when a worker draws one (cv2.imread → None).
+            _present = [p for p in pairs if os.path.isfile(p[0]) and os.path.isfile(p[1])]
+            _n_dropped = len(pairs) - len(_present)
+            if _n_dropped:
+                print('[MyData] dropped {}/{} {} pairs with a missing image/mask on disk.'.format(
+                    _n_dropped, len(pairs), 'train' if is_train else 'val'))
+            pairs = _present
+
+            self.image_paths = [p[0] for p in pairs]
+            self.label_paths = [p[1] for p in pairs]
+            self.crop_metas = [p[2] for p in pairs]
+            if max_samples and len(self.image_paths) > max_samples:
+                self.image_paths = self.image_paths[:max_samples]
+                self.label_paths = self.label_paths[:max_samples]
+                self.crop_metas = self.crop_metas[:max_samples]
+        else:
+            dataset_root = os.path.join(config.data_root_dir, config.task)
+            # datasets can be a list of different datasets for training on combined sets.
+            self.image_paths = []
+            for dataset in datasets.split('+'):
+                image_root = os.path.join(dataset_root, dataset, 'im')
+                self.image_paths += [os.path.join(image_root, p) for p in os.listdir(image_root) if any(p.endswith(ext) for ext in valid_extensions)]
+            self.label_paths = []
+            for p in self.image_paths:
+                for ext in valid_extensions:
+                    ## 'im' and 'gt' may need modifying
+                    p_gt = p.replace('/im/', '/gt/')[:-(len(p.split('.')[-1])+1)] + ext
+                    file_exists = False
+                    if os.path.exists(p_gt):
+                        self.label_paths.append(p_gt)
+                        file_exists = True
+                        break
+                if not file_exists:
+                    print('Not exists:', p_gt)
+
+        if not hasattr(self, 'crop_metas'):
+            self.crop_metas = [None] * len(self.image_paths)
+        if self.load_all and any(self.crop_metas):
+            raise SystemExit('Runtime-cropped CSV rows (wheel_boxes/crop_box) are not supported with '
+                             'config.load_all=True (the crop is drawn per __getitem__).')
 
         if len(self.label_paths) != len(self.image_paths):
             set_image_paths = set([os.path.splitext(p.split(os.sep)[-1])[0] for p in self.image_paths])
@@ -82,22 +170,75 @@ class MyData(data.Dataset):
             # for image_path, label_path in zip(self.image_paths, self.label_paths):
             for image_path, label_path in tqdm(zip(self.image_paths, self.label_paths), total=len(self.image_paths)):
                 _image = path_to_image(image_path, size=self.data_size, color_type='rgb')
-                _label = path_to_image(label_path, size=self.data_size, color_type='gray')
+                _label = self._load_label(label_path)
                 self.images_loaded.append(_image)
                 self.labels_loaded.append(_label)
                 self.class_labels_loaded.append(
                     self.cls_name2id[label_path.split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
                 )
 
+    def _load_label(self, path, size='data_size'):
+        # Color mode is the default for this fork (interior masks are RGB color-coded:
+        # red+green=fg, blue+black=bg). A missing attribute therefore falls back to 'colors',
+        # not grayscale. Back-compat: True ⇒ 'colors'; explicit False/None/'' ⇒ grayscale luminance.
+        mode = getattr(config, 'mask_color_to_binary', 'colors')
+        if mode is True:
+            mode = 'colors'
+        elif mode is False or mode is None or mode == '':
+            mode = 'none'
+        if size == 'data_size':
+            size = self.data_size
+        if mode == 'nonbg':
+            return path_to_binary_mask_nonbg(path, size=size, bg_colors=config.mask_bg_colors)
+        if mode == 'auto':
+            # Per-mask: coloured masks ⇒ red/green rule; pure black&white masks ⇒ white=fg.
+            return path_to_binary_mask_auto(path, size=size, fg_colors=config.mask_fg_colors)
+        if mode == 'colors':
+            return path_to_binary_mask_from_colors(path, size=size, fg_colors=config.mask_fg_colors)
+        return path_to_image(path, size=size, color_type='gray')
+
+    def _load_cropped(self, index, meta):
+        """Full-res image + label, cut to this row's runtime crop, then resized to data_size the
+        same way path_to_image / the mask loaders resize (cv2 INTER_LINEAR)."""
+        image = path_to_image(self.image_paths[index], size=None, color_type='rgb')
+        label = self._load_label(self.label_paths[index], size=None)
+        if label.size != image.size:
+            label = label.resize(image.size, Image.NEAREST)
+        box = crop_box_for(meta, image.size[0], image.size[1], self.is_train, self.image_paths[index],
+                           area=getattr(config, 'crop_frac_area', False))
+        image, label = image.crop(box), label.crop(box)
+        if self.data_size:
+            image = Image.fromarray(cv2.resize(np.asarray(image), self.data_size, interpolation=cv2.INTER_LINEAR))
+            label = Image.fromarray(cv2.resize(np.asarray(label), self.data_size, interpolation=cv2.INTER_LINEAR))
+        return image, label
+
     def __getitem__(self, index):
         if self.load_all:
             image = self.images_loaded[index]
             label = self.labels_loaded[index]
             class_label = self.class_labels_loaded[index] if self.is_train and config.auxiliary_classification else -1
+        elif self.crop_metas[index] is not None:
+            image, label = self._load_cropped(index, self.crop_metas[index])
+            class_label = self.cls_name2id[self.label_paths[index].split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
         else:
             image = path_to_image(self.image_paths[index], size=self.data_size, color_type='rgb')
-            label = path_to_image(self.label_paths[index], size=self.data_size, color_type='gray')
+            label = self._load_label(self.label_paths[index])
             class_label = self.cls_name2id[self.label_paths[index].split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
+
+        # Window-blob loss weight map (train only): flag FG blobs isolated inside window regions.
+        # Loaded at the same data_size as image/label so it stays aligned through preproc+ToTensor.
+        weight = None
+        if self.window_blob_loss and self.crop_metas[index] is not None:
+            # Runtime-cropped rows ship binary red-on-black masks, which have no window (blue)
+            # pixels, so their window-blob map is empty by construction.
+            weight = Image.new('L', label.size, 0)
+        elif self.window_blob_loss:
+            weight = path_to_window_blob_map(
+                self.label_paths[index], size=self.data_size,
+                fg_colors=config.mask_fg_colors, window_colors=config.window_blob_window_colors,
+                ring_radius=config.window_blob_ring_radius, window_frac=config.window_blob_window_frac,
+                max_area_frac=config.window_blob_max_area_frac, min_area=config.window_blob_min_area,
+            )
 
         # loading image and label
         if self.is_train:
@@ -125,7 +266,14 @@ class MyData(data.Dataset):
                         array_background[:, :, idx_channel] = random.randint(0, 255)
                 array_foreground_background = array_foreground * array_mask + array_background * (1 - array_mask)
                 image = Image.fromarray(array_foreground_background.astype(np.uint8))
-            image, label = preproc(image, label, preproc_methods=config.preproc_methods)
+            _lb_fg = getattr(config, 'letterbox_fg', False)
+            _lb_p = getattr(config, 'letterbox_prob', 0.3)
+            if weight is None:
+                image, label = preproc(image, label, preproc_methods=config.preproc_methods,
+                                       letterbox_fg=_lb_fg, letterbox_prob=_lb_p)
+            else:
+                image, label, weight = preproc(image, label, preproc_methods=config.preproc_methods,
+                                               weight=weight, letterbox_fg=_lb_fg, letterbox_prob=_lb_p)
         # else:
         #     if _label.shape[0] > 2048 or _label.shape[1] > 2048:
         #         _image = cv2.resize(_image, (2048, 2048), interpolation=cv2.INTER_LINEAR)
@@ -135,6 +283,8 @@ class MyData(data.Dataset):
         if self.is_train:
             if config.dynamic_size is None:
                 image, label = self.transform_image(image), self.transform_label(label)
+                if weight is not None:
+                    weight = self.transform_label(weight)   # ToTensor → (1,H,W) in [0,1]
         else:
             size_div_32 = (int(image.size[0] // 32 * 32), int(image.size[1] // 32 * 32))
             if image.size != size_div_32:
@@ -143,6 +293,8 @@ class MyData(data.Dataset):
             image, label = self.transform_image(image), self.transform_label(label)
 
         if self.is_train:
+            if weight is not None:
+                return image, label, class_label, weight
             return image, label, class_label
         else:
             return image, label, self.label_paths[index]

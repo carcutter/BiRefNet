@@ -1,0 +1,53 @@
+# Decoder-only fine-tune (360 CUBEMAP bucket) — same recipe as the last run
+# (coarse-swin-l-decoder-closeup-newdata): Swin-L encoder FROZEN and shared, only the decoder trains.
+# Shared encoder + decoder init = coarse-swin-l-window-blob/epoch_685 (the exact base the closeup run
+# resumed from), so this decoder shares the identical encoder with the other decoder-only specializations.
+# Data: interior_360 cube faces (images pixel-identical to the not_backgrounded cube; masks projected
+# from data_link/interior_360/masks via the same equirect->cube projection). Uses the user-provided
+# PANORAMA-LEVEL 80/20 split (all 6 faces of a pano stay on one side; zero pano overlap) via explicit
+# train_csv/val_csv, NOT an rng tile-level split. train=142 panos (852 faces), test=36 panos (216 faces).
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Encoder freeze (decoder-only) ----
+freeze_bb: true                # train the decoder only; the shared encoder stays fixed
+
+# ---- Training loop ----
+# epoch_st parsed from resume filename (epoch_685) => starts 686; 735 = 50 decoder-only epochs.
+epochs: 735
+batch_size: 8                  # decoder-only fp16 @1024 max-batch probe: recommended 8 (ceiling 9)
+ckpt_dir: runs/coarse-swin-l-decoder-cubemap
+resume: runs/coarse-swin-l-window-blob/epoch_685.pth   # shared encoder + decoder base (same as closeup run)
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing / early stop ----
+save_step: 10
+save_last: 100
+early_stop_patience: 10
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l
+input_size: 1024
+mixed_precision: fp16
+
+# ---- Loss ----
+window_blob_loss: false
+
+# ---- Dataset / split ----
+# Explicit pano-level split (csv_index empty => train_csv/val_csv path is used, no rng split).
+csv_index: ""
+val_split: 0
+train_csv: /home/renato/projects/interior-segmentation/interior-segmentation/data/processed/interior_360_cube/train.csv
+val_csv: /home/renato/projects/interior-segmentation/interior-segmentation/data/processed/interior_360_cube/test.csv
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: tensorboard,mlflow
+wandb_project: birefnet-interior
+wandb_run_name: coarse-swin-l-decoder-cubemap
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

@@ -1,0 +1,1 @@
+- [ ] Randomly drop the masks of the crops to make the model not rely too much on the masks

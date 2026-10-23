@@ -5,7 +5,7 @@ import math
 class Config():
     def __init__(self) -> None:
         # Main active settings
-        self.batch_size = 8                                     # Multi-GPU+BF16 training for 76GB / 62GB, without/with compile, on each A100.
+        self.batch_size = 2                                     # 2 to fit a half-full L40S at 1024px (and >1 so BatchNorm exists for the resumed ckpt). Raise on bigger/freer GPUs.
         self.compile = True                                     # 1. PyTorch<=2.0.1 has an inherent CPU memory leak problem; 2.0.1<PyTorch<2.5.0 cannot successfully compile.
         self.mixed_precision = ['no', 'fp16', 'bf16', 'fp8'][2] # 2. FP8 doesn't show acceleration in the torch.compile mode.
         self.SDPA_enabled = True                                # H200x1 + compile==True.  None: 43GB + 14s, math: 43GB + 15s, mem_eff: 35GB + 15s.
@@ -16,8 +16,52 @@ class Config():
         self.sys_home_dir = [os.path.expanduser('~'), '/workspace'][1]   # Default, custom
         self.data_root_dir = os.path.join(self.sys_home_dir, 'datasets/dis')
 
+        # CSV-based data loading (interior-segmentation project layout).
+        # When use_csv_data is True, MyData reads (image_path, mask_path) pairs from a CSV.
+        #   csv_data_root: directory containing train_csv / val_csv files
+        #   csv_image_root: directory the in-CSV paths resolve against (defaults to csv_data_root
+        #                   when None). Split because CSVs are versioned with the index but the
+        #                   bulk images live under a symlinked `data_link/` -> full dataset.
+        _here = os.path.dirname(os.path.abspath(__file__))
+        self.use_csv_data = True
+        self.csv_data_root = os.path.join(_here, 'data', 'interior_segmentation')
+        self.csv_image_root = os.path.join(_here, 'data_link')
+        self.train_csv = 'train.csv'
+        self.val_csv = 'test_smoke.csv'
+        # When set, MyData reads this single CSV and produces train/val slices at
+        # construction time. Takes precedence over train_csv/val_csv when val_split > 0.
+        self.csv_index = ''             # e.g. 'index.csv' to use rng-based split
+        self.val_split = 0.2            # ignored unless csv_index is set
+        self.csv_split_seed = 42        # rng seed for the 80/20 split
+        self.val_every_n_epochs = 1     # 0 disables validation
+        self.val_num_samples = 0        # 0 means all rows in val_csv
+        # GT masks are color-coded class maps (R/G/B/black). For binary segmentation,
+        # collapse them into a single foreground/background mask.
+        #   'none':   load mask as a grayscale image (luminance becomes mask). Original behaviour.
+        #   'nonbg':  any pixel not in mask_bg_colors becomes foreground (union of all classes).
+        #   'colors': only pixels matching one of mask_fg_colors become foreground.
+        #   'auto':   per-mask — coloured masks use the mask_fg_colors (red/green) rule; pure
+        #             black&white masks use white=foreground. For datasets that mix both conventions.
+        self.mask_color_to_binary = 'auto'
+        self.mask_bg_colors = ((0, 0, 0), (0, 0, 255))      # used when mode == 'nonbg': black + blue are bg
+        self.mask_fg_colors = ((255, 0, 0), (0, 255, 0))    # used when mode == 'colors': red + green are fg
+
+        # --- Window-blob loss ---------------------------------------------------------------
+        # Upweight the BCE on foreground (red/green) connected components that sit ISOLATED
+        # inside a window (blue) region — i.e. a FG blob whose surrounding ring is mostly window.
+        # These are small interior objects seen within a window that the model tends to drop.
+        # The dataset emits a 0/1 weight map flagging those blobs; PixLoss then uses a weighted
+        # BCE  weight = 1 + (k-1)*map  (so flagged pixels count k× — k = window_blob_loss_weight).
+        # OFF by default; enabled per-run via train.py --window_blob_loss (these are detection
+        # params, read by MyData; the multiplier k is passed straight to PixLoss from the CLI).
+        self.window_blob_window_colors = ((0, 0, 255),)    # 'window' colors (blue)
+        self.window_blob_ring_radius = 12                  # px ring around a FG blob tested for window
+        self.window_blob_window_frac = 0.5                 # ring must be >= this fraction window to qualify
+        self.window_blob_max_area_frac = 0.2               # ignore FG comps larger than this frac of the image
+        self.window_blob_min_area = 64                     # ignore FG comps smaller than this many px (noise)
+
         # TASK settings
-        self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][0]
+        self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][3]
         self.testsets = {
             # Benchmarks
             'DIS5K': ','.join(['DIS-VD', 'DIS-TE1', 'DIS-TE2', 'DIS-TE3', 'DIS-TE4'][:1]),
@@ -77,7 +121,7 @@ class Config():
         self.num_workers = max(4, self.batch_size)          # will be decreased to min(it, batch_size) at the initialization of the data_loader
 
         # Backbone settings
-        self.bb = [
+        _backbones = [
             'vgg16', 'vgg16bn', 'resnet50',
 
             'swin_v1_l', 'swin_v1_b',
@@ -88,7 +132,14 @@ class Config():
 
             'dino_v3_7b', 'dino_v3_h_plus', 'dino_v3_l',
             'dino_v3_b', 'dino_v3_s_plus', 'dino_v3_s',
-        ][3]
+        ]
+        # Default swin_v1_b — matches weights/BiRefNet-DIS-bb_swin_v1_base-epoch_595.pth.
+        # Overridable via env so a single run can switch backbone (e.g. swin_v1_l for the
+        # general-resolution checkpoint) without editing this file; train.py sets it from
+        # the YAML/--bb BEFORE any Config() is built, so all derivations below stay consistent.
+        self.bb = os.environ.get('BIREFNET_BB') or _backbones[4]
+        if self.bb not in _backbones:
+            raise ValueError('BIREFNET_BB={!r} is not a known backbone. Choose from: {}'.format(self.bb, _backbones))
         self.freeze_bb = 'dino_v3' in self.bb
         self.lateral_channels_in_collection = {
             'vgg16': [512, 512, 256, 128], 'vgg16bn': [512, 512, 256, 128], 'resnet50': [2048, 1024, 512, 256],
@@ -115,7 +166,11 @@ class Config():
         ][0]
 
         # TRAINING settings - inactive
-        self.preproc_methods = ['flip', 'enhance', 'rotate', 'pepper', 'crop'][:4 if not self.background_color_synthesis else 1]
+        self.preproc_methods = ['flip', 'enhance', 'rotate', 'blur', 'crop', 'letterbox'][:6 if not self.background_color_synthesis else 1]
+        # Augmentation knobs (overridable per-run from train.py CLI/YAML):
+        self.letterbox_fg = False        # True => letterbox bars are FOREGROUND (random tb/lr, black/white)
+        self.letterbox_prob = 0.3        # probability the letterbox aug fires (when 'letterbox' in methods)
+        self.crop_frac_area = False      # runtime wheel/random crop: interpret crop frac as AREA (else per-side)
         self.optimizer = ['Adam', 'AdamW'][1]
         self.lr_decay_epochs = [1e5]    # Set to negative N to decay the lr in the last N-th epoch.
         self.lr_decay_rate = 0.5

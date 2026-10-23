@@ -1,0 +1,55 @@
+# Coarse BiRefNet (Swin-L) — DECODER-ONLY fine-tune. The Swin-L encoder is FROZEN and shared;
+# only the decoder (+ squeeze / pyramid / ipt / gdt heads) is trained. This is the first run in the
+# project that does NOT update the encoder — every previous Swin-L run was a full fine-tune.
+#
+# freeze_bb=true sets requires_grad=False on all bb.* params before the optimizer is built
+# (train.py), so the encoder weights loaded from `resume` stay fixed. Swin uses LayerNorm (no
+# running stats), so freezing requires_grad fully fixes the encoder; the decoder's BatchNorm stays
+# trainable (hence batch_size must remain > 1).
+#
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+
+# ---- Encoder freeze ----
+freeze_bb: true               # train decoder only; keep the shared Swin-L encoder fixed
+
+# ---- Training loop ----
+# epoch_st is parsed from the resume filename (epoch_690) ⇒ starts at 691; 730 = 40 decoder-only epochs.
+epochs: 730
+batch_size: 2                 # bs must stay > 1 for the decoder BatchNorm (freezing the encoder doesn't change that).
+ckpt_dir: runs/coarse-swin-l-decoder-only
+# Shared encoder + decoder init = the current best generalist coarse model (from-dis-noblob, ep690,
+# Val/Contour_mIoU=0.8287). This is the encoder that gets frozen.
+resume: runs/coarse-swin-l-from-dis-noblob/epoch_690.pth
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing ----
+save_step: 10
+save_last: 40                 # spans the whole 40-epoch run
+
+# ---- Early stopping ----
+early_stop_patience: 10       # stop if Val/Contour_mIoU doesn't improve for 10 validations (0 = off)
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l                 # must match the resume checkpoint's backbone
+input_size: 1024
+
+# ---- Window-blob loss ----
+window_blob_loss: false       # matches the noblob lineage of the resume checkpoint
+
+# ---- Dataset / split ----
+csv_index: train_interior_rims_refinement.csv
+val_split: 0.2
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: both
+wandb_project: birefnet-interior
+wandb_run_name: null
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

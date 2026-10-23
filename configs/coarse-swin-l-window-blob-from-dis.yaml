@@ -1,0 +1,54 @@
+# Coarse BiRefNet (Swin-L) — SINGLE-STAGE fine-tune straight from the public DIS checkpoint on the
+# combined interior + rims + refinement dataset, with the window-blob loss.
+#
+# Unlike coarse-swin-l-window-blob.yaml (which staged 590 -> 640 -> refinement), this resumes from
+# the official DIS-pretrained weights (epoch_590) and fine-tunes for 100 epochs in one go.
+#
+# Precedence (strict): argparse defaults < this file < CLI flags. Unknown keys fail loudly.
+# Resolved config is dumped to <ckpt_dir>/config.resolved.yaml at train start.
+
+# ---- Training loop ----
+# epochs is the ABSOLUTE target: epoch_st is parsed from the resume filename (epoch_590), so
+# 690 = 590 + 100 ⇒ 100 fine-tuning epochs.
+epochs: 690
+batch_size: 2                # Swin-L @1024; bs=1 breaks BatchNorm (needs >1 value per channel).
+ckpt_dir: runs/coarse-swin-l-window-blob-from-dis
+resume: weights/BiRefNet-DIS-epoch_590.pth      # official public DIS-pretrained Swin-L checkpoint
+dist: false
+use_accelerate: false
+smoke_test: 0
+
+# ---- Checkpointing ----
+# save_last=100 (>= the 100 training epochs) so the save window spans the whole run, and
+# save_step=10 ⇒ a checkpoint every 10 epochs (600, 610, ..., 690). best.pth is additionally
+# refreshed whenever Val/Contour_mIoU improves (see early stopping below).
+save_step: 10
+save_last: 100
+
+# ---- Early stopping ----
+early_stop_patience: 10       # stop if Val/Contour_mIoU doesn't improve for 10 consecutive validations
+early_stop_min_delta: 0.0
+
+# ---- Model ----
+bb: swin_v1_l                 # must match the DIS checkpoint's backbone
+input_size: 1024              # square 1024; each side divisible by 32
+
+# ---- Window-blob loss ----
+window_blob_loss: true
+window_blob_loss_weight: 5.0
+
+# ---- Dataset / split ----
+# Combined index: interior (train.csv) + rims (detail_crops) + refinement (kw2624). 80/20 rng split.
+csv_index: train_interior_rims_refinement.csv
+val_split: 0.2
+csv_split_seed: 42
+num_workers: 8
+
+# ---- Experiment logging ----
+logger: both
+wandb_project: birefnet-interior
+wandb_run_name: null          # null ⇒ basename(ckpt_dir)
+wandb_entity: meero_rd
+
+# ---- Metrics ----
+contour_radius: 4

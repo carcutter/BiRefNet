@@ -150,3 +150,17 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+data/
+weights/
+
+# Training scaffold (YAML/CSV workflow)
+runs/
+reports/
+wandb/
+tools/viewer/manifest.json
+
+# Machine-specific dataset symlink (points to a local absolute path)
+data_link
+# Stray scratch checkpoints
+temp/

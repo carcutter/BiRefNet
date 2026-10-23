@@ -151,14 +151,26 @@ class PixLoss(nn.Module):
         if 'structure' in self.lambdas_pix_last and self.lambdas_pix_last['structure']:
             self.criterions_last['structure'] = StructureLoss()
 
-    def forward(self, scaled_preds, gt, pix_loss_lambda=1.0):
+    def forward(self, scaled_preds, gt, pix_loss_lambda=1.0, weight_map=None, weight_k=1.0):
+        # weight_map: optional (B,1,H,W) in [0,1] flagging pixels to upweight (e.g. FG blobs inside
+        #   windows). weight_k: their BCE multiplier. When both are active the 'bce' term uses a
+        #   spatially-weighted BCE  w = 1 + (k-1)*map  instead of the plain mean BCE; every other
+        #   criterion is unchanged. No-op when weight_map is None or weight_k == 1.
+        use_weighted_bce = weight_map is not None and weight_k != 1.0
         loss = 0.
         loss_dict = {}
         for _, pred_lvl in enumerate(scaled_preds):
             if pred_lvl.shape != gt.shape:
                 pred_lvl = nn.functional.interpolate(pred_lvl, size=gt.shape[2:], mode='bilinear', align_corners=True)
+            if use_weighted_bce and weight_map.shape[2:] != gt.shape[2:]:
+                weight_map = nn.functional.interpolate(weight_map, size=gt.shape[2:], mode='nearest')
             for criterion_name, criterion in self.criterions_last.items():
-                _loss = criterion(pred_lvl.sigmoid(), gt) * self.lambdas_pix_last[criterion_name] * pix_loss_lambda
+                if criterion_name == 'bce' and use_weighted_bce:
+                    w = 1.0 + (weight_k - 1.0) * weight_map
+                    _loss = F.binary_cross_entropy(pred_lvl.sigmoid(), gt, weight=w, reduction='mean') \
+                        * self.lambdas_pix_last['bce'] * pix_loss_lambda
+                else:
+                    _loss = criterion(pred_lvl.sigmoid(), gt) * self.lambdas_pix_last[criterion_name] * pix_loss_lambda
                 loss += _loss
                 loss_dict[criterion_name] = loss_dict.get(criterion_name, 0.) + _loss.item() / len(scaled_preds)
                 # print(criterion_name, _loss.item())
