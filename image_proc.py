@@ -104,11 +104,13 @@ def refine_foreground(image, mask, r=90, device='cuda'):
     return estimated_foreground
 
 
-def preproc(image, label, preproc_methods=['flip'], weight=None):
+def preproc(image, label, preproc_methods=['flip'], weight=None, letterbox_fg=False, letterbox_prob=0.3):
     # `weight` is an optional extra label-aligned PIL map (e.g. the window-blob loss-weight map).
     # It rides the same GEOMETRIC ops as the label (flip/crop/rotate) so it stays pixel-aligned;
     # the image-only ops (enhance/blur) leave it untouched. Returns (image, label) when weight is
     # None, else (image, label, weight) — so existing 2-arg callers are unaffected.
+    # `letterbox_fg=True` swaps the standard (background-bar) letterbox for the FOREGROUND-bar
+    # variant (random top/bottom OR left/right, black OR white bars, bars labelled foreground).
     if 'flip' in preproc_methods:
         image, label, weight = cv_random_flip(image, label, weight)
     if 'crop' in preproc_methods:
@@ -116,7 +118,10 @@ def preproc(image, label, preproc_methods=['flip'], weight=None):
     if 'rotate' in preproc_methods:
         image, label, weight = random_rotate(image, label, weight)
     if 'letterbox' in preproc_methods:
-        image, label, weight = random_letterbox(image, label, weight)
+        if letterbox_fg:
+            image, label, weight = random_letterbox_fg(image, label, weight, prob=letterbox_prob)
+        else:
+            image, label, weight = random_letterbox(image, label, weight, prob=letterbox_prob)
     if 'enhance' in preproc_methods:
         image = color_enhance(image)
     if 'blur' in preproc_methods:
@@ -188,6 +193,47 @@ def random_letterbox(image, label, weight=None, prob=0.3, max_frac=0.3):
     if weight is not None:
         out_w = Image.new(weight.mode, (W, H), 0)                        # no upweighting in the bars
         out_w.paste(weight.resize((W, content_h), Image.NEAREST), (0, top))
+        weight = out_w
+    return image, label, weight
+
+
+def random_letterbox_fg(image, label, weight=None, prob=0.3, max_frac=0.3):
+    """Letterbox pad whose bars are FOREGROUND (opposite of `random_letterbox`). With probability
+    `prob`, shrink the content along one axis and add solid bars so the frame keeps its size:
+
+    * orientation is chosen at random — bars on TOP+BOTTOM or on LEFT+RIGHT;
+    * the bar colour is chosen at random — solid BLACK or solid WHITE on the image;
+    * on the mask the bars are painted FOREGROUND (255), and on the weight map 0.
+
+    Teaches the model that solid matte/letterbox bars belong to the foreground. The total border
+    size is a random fraction (up to `max_frac`) of the shrunk axis, split randomly between the two
+    sides (band centred or offset). Content is resized (bilinear image / nearest label+weight) into
+    the remaining band. Output size is unchanged so fixed-resolution batch collation is preserved.
+    """
+    if random.random() >= prob:
+        return image, label, weight
+    W, H = image.size
+    horizontal_bars = random.random() < 0.5          # True => bars on top/bottom (shrink height)
+    axis = H if horizontal_bars else W
+    total = min(int(round(random.uniform(0.05, max_frac) * axis)), axis - 1)
+    if total <= 0:
+        return image, label, weight
+    lead = random.randint(0, total)                   # top (or left) bar; remainder is bottom (right)
+    fill = random.choice((0, 255))                    # black or white bars on the image
+    img_fill = (fill,) * len(image.getbands())
+    if horizontal_bars:
+        content, paste = (W, H - total), (0, lead)
+    else:
+        content, paste = (W - total, H), (lead, 0)
+
+    out_img = Image.new(image.mode, (W, H), img_fill)
+    out_img.paste(image.resize(content, Image.BILINEAR), paste)
+    out_lab = Image.new(label.mode, (W, H), 255)      # bars = FOREGROUND
+    out_lab.paste(label.resize(content, Image.NEAREST), paste)
+    image, label = out_img, out_lab
+    if weight is not None:
+        out_w = Image.new(weight.mode, (W, H), 0)
+        out_w.paste(weight.resize(content, Image.NEAREST), paste)
         weight = out_w
     return image, label, weight
 

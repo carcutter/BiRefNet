@@ -112,6 +112,12 @@ def build_parser():
     p.add_argument('--csv_split_seed', default=None, type=int,
                    help='Seed for the rng-based 80/20 split. Same seed + flipped is_train ⇒ disjoint '
                         'subsets. Overrides config.csv_split_seed.')
+    p.add_argument('--train_csv', default=None, type=str,
+                   help='Explicit train-split CSV (path, or filename under config.csv_data_root). '
+                        'Used only when --csv_index is empty. Overrides config.train_csv.')
+    p.add_argument('--val_csv', default=None, type=str,
+                   help='Explicit val/test-split CSV (path, or filename under config.csv_data_root). '
+                        'Used only when --csv_index is empty. Overrides config.val_csv.')
     p.add_argument('--input_size', default=None, type=str,
                    help='Override config.size. Accepts a single int (square, e.g. 512) or "H,W"/"HxW". '
                         'Each side must be divisible by 32.')
@@ -163,6 +169,17 @@ def build_parser():
                    help='Override config.mixed_precision. In the manual (non-accelerate) path this '
                         'enables AMP autocast for the training forward (+ GradScaler for fp16); '
                         'validation already autocasts at this precision.')
+    p.add_argument('--preproc_methods', default=None, type=str,
+                   help='Comma-separated override of config.preproc_methods (train augs), e.g. '
+                        '"flip,enhance,rotate,blur,letterbox". Overrides config.preproc_methods.')
+    p.add_argument('--letterbox_fg', default=None, type=lambda x: str(x).lower() == 'true',
+                   help='True => the letterbox aug paints FOREGROUND bars (random top/bottom or '
+                        'left/right, black or white) instead of the default background bars.')
+    p.add_argument('--letterbox_prob', default=None, type=float,
+                   help='Probability the letterbox aug fires (default config.letterbox_prob=0.3).')
+    p.add_argument('--crop_frac_area', default=None, type=lambda x: str(x).lower() == 'true',
+                   help='True => the runtime wheel/random crop draws its size as a fraction of image '
+                        'AREA (40-70%% => sqrt per side) instead of per-side. Needs wheel_boxes rows.')
     return p
 
 
@@ -179,6 +196,18 @@ if args.val_split is not None:
     config.val_split = args.val_split
 if args.csv_split_seed is not None:
     config.csv_split_seed = args.csv_split_seed
+if args.train_csv is not None:
+    config.train_csv = args.train_csv
+if args.val_csv is not None:
+    config.val_csv = args.val_csv
+if args.preproc_methods is not None:
+    config.preproc_methods = [m.strip() for m in args.preproc_methods.split(',') if m.strip()]
+if args.letterbox_fg is not None:
+    config.letterbox_fg = args.letterbox_fg
+if args.letterbox_prob is not None:
+    config.letterbox_prob = args.letterbox_prob
+if args.crop_frac_area is not None:
+    config.crop_frac_area = args.crop_frac_area
 if args.input_size is not None:
     parts = [int(v) for v in str(args.input_size).lower().replace('x', ',').split(',') if v.strip()]
     if len(parts) == 1:

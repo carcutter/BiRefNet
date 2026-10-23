@@ -167,6 +167,10 @@ class Config():
 
         # TRAINING settings - inactive
         self.preproc_methods = ['flip', 'enhance', 'rotate', 'blur', 'crop', 'letterbox'][:6 if not self.background_color_synthesis else 1]
+        # Augmentation knobs (overridable per-run from train.py CLI/YAML):
+        self.letterbox_fg = False        # True => letterbox bars are FOREGROUND (random tb/lr, black/white)
+        self.letterbox_prob = 0.3        # probability the letterbox aug fires (when 'letterbox' in methods)
+        self.crop_frac_area = False      # runtime wheel/random crop: interpret crop frac as AREA (else per-side)
         self.optimizer = ['Adam', 'AdamW'][1]
         self.lr_decay_epochs = [1e5]    # Set to negative N to decay the lr in the last N-th epoch.
         self.lr_decay_rate = 0.5

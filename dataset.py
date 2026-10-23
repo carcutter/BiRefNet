@@ -10,6 +10,7 @@ from torchvision import transforms
 
 from image_proc import preproc
 from config import Config
+from runtime_crop import parse_crop_meta, crop_box_for
 from utils import path_to_image, path_to_binary_mask_from_colors, path_to_binary_mask_nonbg, path_to_binary_mask_auto, path_to_window_blob_map
 
 
@@ -89,7 +90,9 @@ class MyData(data.Dataset):
                         return cand
                 return os.path.join(candidate_roots[0], rel)   # let a clear FileNotFound surface downstream
 
-            pairs = []   # list of (img_abs, msk_abs)
+            # list of (img_abs, msk_abs, crop_meta); crop_meta is None unless the row carries
+            # wheel_boxes / crop_box columns (full originals cropped at load, see runtime_crop.py).
+            pairs = []
             with open(csv_path, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -98,7 +101,7 @@ class MyData(data.Dataset):
                     msk_rel = (row.get('mask_path') or row.get('mask') or '').strip()
                     if not img_rel or not msk_rel:
                         continue
-                    pairs.append((_resolve(img_rel), _resolve(msk_rel)))
+                    pairs.append((_resolve(img_rel), _resolve(msk_rel), parse_crop_meta(row)))
 
             if val_split and 0.0 < val_split < 1.0:
                 # Deterministic 80/20-style split. Same seed + flipped is_train ⇒ disjoint subsets.
@@ -115,7 +118,7 @@ class MyData(data.Dataset):
             # PRESENT samples is identical regardless of which subsets happen to be on disk —
             # only the missing entries are removed. Prevents a 5%-of-index missing dataset from
             # crashing a long run when a worker draws one (cv2.imread → None).
-            _present = [(im, mk) for (im, mk) in pairs if os.path.isfile(im) and os.path.isfile(mk)]
+            _present = [p for p in pairs if os.path.isfile(p[0]) and os.path.isfile(p[1])]
             _n_dropped = len(pairs) - len(_present)
             if _n_dropped:
                 print('[MyData] dropped {}/{} {} pairs with a missing image/mask on disk.'.format(
@@ -124,9 +127,11 @@ class MyData(data.Dataset):
 
             self.image_paths = [p[0] for p in pairs]
             self.label_paths = [p[1] for p in pairs]
+            self.crop_metas = [p[2] for p in pairs]
             if max_samples and len(self.image_paths) > max_samples:
                 self.image_paths = self.image_paths[:max_samples]
                 self.label_paths = self.label_paths[:max_samples]
+                self.crop_metas = self.crop_metas[:max_samples]
         else:
             dataset_root = os.path.join(config.data_root_dir, config.task)
             # datasets can be a list of different datasets for training on combined sets.
@@ -147,6 +152,12 @@ class MyData(data.Dataset):
                 if not file_exists:
                     print('Not exists:', p_gt)
 
+        if not hasattr(self, 'crop_metas'):
+            self.crop_metas = [None] * len(self.image_paths)
+        if self.load_all and any(self.crop_metas):
+            raise SystemExit('Runtime-cropped CSV rows (wheel_boxes/crop_box) are not supported with '
+                             'config.load_all=True (the crop is drawn per __getitem__).')
+
         if len(self.label_paths) != len(self.image_paths):
             set_image_paths = set([os.path.splitext(p.split(os.sep)[-1])[0] for p in self.image_paths])
             set_label_paths = set([os.path.splitext(p.split(os.sep)[-1])[0] for p in self.label_paths])
@@ -166,7 +177,7 @@ class MyData(data.Dataset):
                     self.cls_name2id[label_path.split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
                 )
 
-    def _load_label(self, path):
+    def _load_label(self, path, size='data_size'):
         # Color mode is the default for this fork (interior masks are RGB color-coded:
         # red+green=fg, blue+black=bg). A missing attribute therefore falls back to 'colors',
         # not grayscale. Back-compat: True ⇒ 'colors'; explicit False/None/'' ⇒ grayscale luminance.
@@ -175,20 +186,40 @@ class MyData(data.Dataset):
             mode = 'colors'
         elif mode is False or mode is None or mode == '':
             mode = 'none'
+        if size == 'data_size':
+            size = self.data_size
         if mode == 'nonbg':
-            return path_to_binary_mask_nonbg(path, size=self.data_size, bg_colors=config.mask_bg_colors)
+            return path_to_binary_mask_nonbg(path, size=size, bg_colors=config.mask_bg_colors)
         if mode == 'auto':
             # Per-mask: coloured masks ⇒ red/green rule; pure black&white masks ⇒ white=fg.
-            return path_to_binary_mask_auto(path, size=self.data_size, fg_colors=config.mask_fg_colors)
+            return path_to_binary_mask_auto(path, size=size, fg_colors=config.mask_fg_colors)
         if mode == 'colors':
-            return path_to_binary_mask_from_colors(path, size=self.data_size, fg_colors=config.mask_fg_colors)
-        return path_to_image(path, size=self.data_size, color_type='gray')
+            return path_to_binary_mask_from_colors(path, size=size, fg_colors=config.mask_fg_colors)
+        return path_to_image(path, size=size, color_type='gray')
+
+    def _load_cropped(self, index, meta):
+        """Full-res image + label, cut to this row's runtime crop, then resized to data_size the
+        same way path_to_image / the mask loaders resize (cv2 INTER_LINEAR)."""
+        image = path_to_image(self.image_paths[index], size=None, color_type='rgb')
+        label = self._load_label(self.label_paths[index], size=None)
+        if label.size != image.size:
+            label = label.resize(image.size, Image.NEAREST)
+        box = crop_box_for(meta, image.size[0], image.size[1], self.is_train, self.image_paths[index],
+                           area=getattr(config, 'crop_frac_area', False))
+        image, label = image.crop(box), label.crop(box)
+        if self.data_size:
+            image = Image.fromarray(cv2.resize(np.asarray(image), self.data_size, interpolation=cv2.INTER_LINEAR))
+            label = Image.fromarray(cv2.resize(np.asarray(label), self.data_size, interpolation=cv2.INTER_LINEAR))
+        return image, label
 
     def __getitem__(self, index):
         if self.load_all:
             image = self.images_loaded[index]
             label = self.labels_loaded[index]
             class_label = self.class_labels_loaded[index] if self.is_train and config.auxiliary_classification else -1
+        elif self.crop_metas[index] is not None:
+            image, label = self._load_cropped(index, self.crop_metas[index])
+            class_label = self.cls_name2id[self.label_paths[index].split('/')[-1].split('#')[3]] if self.is_train and config.auxiliary_classification else -1
         else:
             image = path_to_image(self.image_paths[index], size=self.data_size, color_type='rgb')
             label = self._load_label(self.label_paths[index])
@@ -197,7 +228,11 @@ class MyData(data.Dataset):
         # Window-blob loss weight map (train only): flag FG blobs isolated inside window regions.
         # Loaded at the same data_size as image/label so it stays aligned through preproc+ToTensor.
         weight = None
-        if self.window_blob_loss:
+        if self.window_blob_loss and self.crop_metas[index] is not None:
+            # Runtime-cropped rows ship binary red-on-black masks, which have no window (blue)
+            # pixels, so their window-blob map is empty by construction.
+            weight = Image.new('L', label.size, 0)
+        elif self.window_blob_loss:
             weight = path_to_window_blob_map(
                 self.label_paths[index], size=self.data_size,
                 fg_colors=config.mask_fg_colors, window_colors=config.window_blob_window_colors,
@@ -231,10 +266,14 @@ class MyData(data.Dataset):
                         array_background[:, :, idx_channel] = random.randint(0, 255)
                 array_foreground_background = array_foreground * array_mask + array_background * (1 - array_mask)
                 image = Image.fromarray(array_foreground_background.astype(np.uint8))
+            _lb_fg = getattr(config, 'letterbox_fg', False)
+            _lb_p = getattr(config, 'letterbox_prob', 0.3)
             if weight is None:
-                image, label = preproc(image, label, preproc_methods=config.preproc_methods)
+                image, label = preproc(image, label, preproc_methods=config.preproc_methods,
+                                       letterbox_fg=_lb_fg, letterbox_prob=_lb_p)
             else:
-                image, label, weight = preproc(image, label, preproc_methods=config.preproc_methods, weight=weight)
+                image, label, weight = preproc(image, label, preproc_methods=config.preproc_methods,
+                                               weight=weight, letterbox_fg=_lb_fg, letterbox_prob=_lb_p)
         # else:
         #     if _label.shape[0] > 2048 or _label.shape[1] > 2048:
         #         _image = cv2.resize(_image, (2048, 2048), interpolation=cv2.INTER_LINEAR)

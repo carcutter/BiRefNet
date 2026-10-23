@@ -87,20 +87,30 @@ class _NullCtx:
     def __exit__(self, *a): return False
 
 
-def _build_model(checkpoint, device):
+def _build_model(checkpoint, device, freeze_bb=False):
     model = BiRefNet(bb_pretrained=False).to(device)
     if checkpoint:
         sd = torch.load(checkpoint, map_location='cpu', weights_only=True)
         sd = check_state_dict(sd)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print('  loaded {}  (missing={} unexpected={})'.format(checkpoint, len(missing), len(unexpected)))
+    if freeze_bb:
+        # Match decoder-only training: freezing the encoder frees its activations from the backward
+        # graph, so the memory footprint (and thus the max batch) reflects the real run.
+        n_fro = n_tr = 0
+        for name, p in model.named_parameters():
+            if 'bb.' in name and 'refiner.' not in name:
+                p.requires_grad = False; n_fro += p.numel()
+            elif p.requires_grad:
+                n_tr += p.numel()
+        print('  freeze_bb: froze encoder ({:.1f}M); trainable decoder = {:.1f}M'.format(n_fro / 1e6, n_tr / 1e6))
     model.train()
     return model
 
 
 def find_max_batch(model, H, W, device, amp, do_backward,
                    start=1, hard_cap=1024, margin=0.9, warmup=3):
-    opt = torch.optim.SGD(model.parameters(), lr=1e-9)
+    opt = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=1e-9)
     scaler = torch.amp.GradScaler() if (amp and do_backward) else None
 
     # Phase 1: doubling.
@@ -158,6 +168,9 @@ def build_parser():
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--amp', action='store_true', help='Wrap forward in bf16 autocast (matches typical training)')
     p.add_argument('--no_backward', action='store_true', help='Forward-only probe (inference-time number — NOT for training)')
+    p.add_argument('--freeze_bb', default=False, type=lambda x: str(x).lower() == 'true',
+                   help='Freeze the encoder (decoder-only). Frees encoder activations from the backward '
+                        'graph so the probed memory/max-batch matches a freeze_bb=true training run.')
     p.add_argument('--margin', default=0.9, type=float, help='Multiply the ceiling by this; default 0.9')
     p.add_argument('--warmup_iters', default=3, type=int)
     p.add_argument('--out', default=None, help='Write the result as YAML to this path')
@@ -178,8 +191,8 @@ def main():
     print('  input_size = {}x{}   amp={}   backward={}   warmup_iters={}'.format(
         H, W, args.amp, do_backward, args.warmup_iters))
 
-    print('Building BiRefNet on {}'.format(device))
-    model = _build_model(args.checkpoint, device)
+    print('Building BiRefNet on {}  (freeze_bb={})'.format(device, args.freeze_bb))
+    model = _build_model(args.checkpoint, device, freeze_bb=args.freeze_bb)
 
     recommended, ceiling = find_max_batch(
         model, H, W, device,
